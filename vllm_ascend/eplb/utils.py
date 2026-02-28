@@ -18,14 +18,19 @@
 import types
 
 import torch
+from vllm.logger import logger
 
 
 def get_expert_map(self, layer_id):
-    return self.model.layers[layer_id].mlp.experts.expert_map
+    moe_model = get_eplb_moe_model(self)
+    logger.debug("EPLB get_expert_map: layer_id=%d", layer_id)
+    return moe_model.model.layers[layer_id].mlp.experts.expert_map
 
 
 def get_log2phy_map(self, layer_id):
-    return self.model.layers[layer_id].mlp.experts.get_log2phy_map()
+    moe_model = get_eplb_moe_model(self)
+    logger.debug("EPLB get_log2phy_map: layer_id=%d", layer_id)
+    return moe_model.model.layers[layer_id].mlp.experts.get_log2phy_map()
 
 
 def get_all_expert_map(self, num_moe_layers):
@@ -41,10 +46,16 @@ def get_all_expert_map(self, num_moe_layers):
 
 
 def get_all_moe_loads(self):
+    moe_model = get_eplb_moe_model(self)
     num_dense_layers = self.num_dense_layers if hasattr(
         self, "num_dense_layers") else 0
+    logger.debug(
+        "EPLB get_all_moe_loads: num_moe_layers=%d, num_dense_layers=%d",
+        self.num_moe_layers,
+        num_dense_layers,
+    )
     all_moe_loads = torch.stack(
-        [self.model.layers[layer_id + num_dense_layers].mlp.experts.moe_load \
+        [moe_model.model.layers[layer_id + num_dense_layers].mlp.experts.moe_load \
             for layer_id in range(self.num_moe_layers)],
         dim=0
     )
@@ -52,11 +63,28 @@ def get_all_moe_loads(self):
 
 
 def clear_all_moe_loads(self):
+    moe_model = get_eplb_moe_model(self)
     num_dense_layers = self.num_dense_layers if hasattr(
         self, "num_dense_layers") else 0
+    logger.debug(
+        "EPLB clear_all_moe_loads: num_moe_layers=%d, num_dense_layers=%d",
+        self.num_moe_layers,
+        num_dense_layers,
+    )
     for layer_id in range(self.num_moe_layers):
-        self.model.layers[layer_id +
-                          num_dense_layers].mlp.experts.clear_moe_load()
+        moe_model.model.layers[layer_id +
+                               num_dense_layers].mlp.experts.clear_moe_load()
+
+
+def get_eplb_moe_model(model):
+    if hasattr(model, "get_language_model"):
+        language_model = model.get_language_model()
+        if language_model is not None:
+            logger.debug("EPLB resolved language model via get_language_model")
+            return language_model
+    if hasattr(model, "language_model"):
+        logger.debug("EPLB resolved language model via language_model attr")
+    return getattr(model, "language_model", model)
 
 
 def model_register(model, model_config):
@@ -67,11 +95,32 @@ def model_register(model, model_config):
     model.clear_all_moe_loads = types.MethodType(clear_all_moe_loads, model)
 
     config = model_config.hf_text_config
+    model_type = getattr(config, "model_type", "")
+    text_config = getattr(config, "text_config", config)
+    if model_type == "qwen3_vl_moe":
+        # Compatibility for cases where hf_text_config falls back to top-level
+        # multimodal config instead of text sub-config.
+        config = text_config
+        model_type = getattr(config, "model_type", model_type)
 
-    if config.model_type == "qwen3_moe":
-        model.num_moe_layers = config.num_hidden_layers
-    elif config.model_type == "deepseek_v2" or config.model_type == "deepseek_v3":
+    if model_type in ("qwen3_moe", "qwen3_vl_moe_text"):
+        model.num_dense_layers = getattr(config, "first_k_dense_replace", 0)
+        model.num_moe_layers = config.num_hidden_layers - model.num_dense_layers
+    elif model_type == "deepseek_v2" or model_type == "deepseek_v3":
         model.num_dense_layers = config.first_k_dense_replace
         model.num_moe_layers = config.num_hidden_layers - model.num_dense_layers
     else:
         raise NotImplementedError("EPLB is not supported.")
+
+    # Keep wrapper model and inner language model EPLB metadata consistent.
+    moe_model = get_eplb_moe_model(model)
+    moe_model.num_dense_layers = model.num_dense_layers
+    moe_model.num_moe_layers = model.num_moe_layers
+    logger.info(
+        "EPLB model_register done: model_type=%s, num_dense_layers=%d, "
+        "num_moe_layers=%d, wrapped_language_model=%s",
+        model_type,
+        model.num_dense_layers,
+        model.num_moe_layers,
+        moe_model is not model,
+    )

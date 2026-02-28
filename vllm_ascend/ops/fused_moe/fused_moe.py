@@ -74,6 +74,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         super().__init__(moe=moe)
         self.dynamic_eplb = get_ascend_config().dynamic_eplb
+        logger.info_once(
+            "EPLB unquantized static map support is enabled for this model.")
+
+    @property
+    def supports_eplb(self):
+        # Unquantized/BF16 MoE can use static expert-map placement.
+        return True
 
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod,

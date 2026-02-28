@@ -30,40 +30,72 @@ class VllmEplbAdaptor(EplbAdaptor):
     def __init__(self, model, **args):
         super().__init__(**args)
         self.model = model
+        self.moe_model = self.get_eplb_moe_model(model)
         self.rank_id = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.param_dict = dict(self.model.named_parameters())
-        self.num_dense_layers = getattr(self.model.config,
-                                        "first_k_dense_replace", 0)
-        self.num_moe_layers = self.model.config.num_hidden_layers - self.num_dense_layers
+        self.param_dict = dict(self.moe_model.named_parameters())
+        self.num_dense_layers = getattr(
+            self.model, "num_dense_layers",
+            getattr(self.moe_model.config, "first_k_dense_replace", 0))
+        self.num_moe_layers = getattr(
+            self.model, "num_moe_layers",
+            self.moe_model.config.num_hidden_layers - self.num_dense_layers)
+        logger.info(
+            "EPLB adaptor init: model_type=%s, num_dense_layers=%d, "
+            "num_moe_layers=%d, wrapped_language_model=%s",
+            getattr(self.moe_model.config, "model_type", "unknown"),
+            self.num_dense_layers,
+            self.num_moe_layers,
+            self.moe_model is not self.model,
+        )
 
-        for i in range(self.num_dense_layers,
-                       self.model.config.num_hidden_layers):
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w13_weight_list"] = \
-                self.model.model.layers[i].mlp.experts.w13_weight_list
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w2_weight_list"] = \
-                self.model.model.layers[i].mlp.experts.w2_weight_list
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w13_weight_scale_fp32_list"] = \
-                self.model.model.layers[i].mlp.experts.w13_weight_scale_fp32_list
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w2_weight_scale_list"] = \
-                self.model.model.layers[i].mlp.experts.w2_weight_scale_list
-            self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w2_weight_scale_fp32_list"] = \
-                self.model.model.layers[i].mlp.experts.w2_weight_scale_fp32_list
-        # TODO: init self.expert_weight_names depending on different model types, only deepseek v3 w8a8 and qwen3-moe is supported here
-        if self.model.quant_config is not None:
+        first_moe_experts = self.moe_model.model.layers[
+            self.num_dense_layers].mlp.experts
+        self.use_list_expert_weights = hasattr(first_moe_experts,
+                                               "w13_weight_list")
+        if self.use_list_expert_weights:
+            for i in range(self.num_dense_layers,
+                           self.num_dense_layers + self.num_moe_layers):
+                experts = self.moe_model.model.layers[i].mlp.experts
+                self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w13_weight_list"] = \
+                    experts.w13_weight_list
+                self.param_dict["model.layers." + str(i) + ".mlp.experts." + "w2_weight_list"] = \
+                    experts.w2_weight_list
+                if hasattr(experts, "w13_weight_scale_fp32_list"):
+                    self.param_dict[
+                        "model.layers." + str(i) + ".mlp.experts." +
+                        "w13_weight_scale_fp32_list"] = experts.w13_weight_scale_fp32_list
+                if hasattr(experts, "w2_weight_scale_list"):
+                    self.param_dict[
+                        "model.layers." + str(i) + ".mlp.experts." +
+                        "w2_weight_scale_list"] = experts.w2_weight_scale_list
+                if hasattr(experts, "w2_weight_scale_fp32_list"):
+                    self.param_dict[
+                        "model.layers." + str(i) + ".mlp.experts." +
+                        "w2_weight_scale_fp32_list"] = experts.w2_weight_scale_fp32_list
             self.expert_weight_names = [
-                "w13_weight_list", "w2_weight_list",
-                "w13_weight_scale_fp32_list", "w13_weight_offset",
-                "w2_weight_scale_list", "w2_weight_offset",
-                "w2_weight_scale_fp32_list"
+                name for name in [
+                    "w13_weight_list", "w2_weight_list",
+                    "w13_weight_scale_fp32_list", "w13_weight_offset",
+                    "w2_weight_scale_list", "w2_weight_offset",
+                    "w2_weight_scale_fp32_list"
+                ] if "model.layers." + str(self.num_dense_layers) +
+                ".mlp.experts." + name in self.param_dict
             ]
+            logger.info("EPLB adaptor expert-weight mode: list (%d names)",
+                        len(self.expert_weight_names))
         else:
             self.expert_weight_names = ["w13_weight", "w2_weight"]
+            logger.info(
+                "EPLB adaptor expert-weight mode: tensor (%d names), "
+                "fallback for AscendFusedMoE without *_weight_list",
+                len(self.expert_weight_names),
+            )
 
         self.expert_map_per_layer_cpu = dict(
         )  # copy of expert map on CPU to avoid device synchronize frequently
 
-        num_buffer_tensor = self.model.model.layers[
+        num_buffer_tensor = self.moe_model.model.layers[
             -1].mlp.experts.local_num_experts
         self.buffer_tensor_list: list[list[Any]] = [
             [] for _ in range(num_buffer_tensor)
@@ -77,13 +109,23 @@ class VllmEplbAdaptor(EplbAdaptor):
         for layer_idx in range(self.num_moe_layers):
             self.log2phy_map_per_layer[self.num_dense_layers + layer_idx] = \
                 self.model.get_log2phy_map(self.num_dense_layers + layer_idx)
+        logger.info("EPLB adaptor prepared: num_buffer_tensor=%d",
+                    num_buffer_tensor)
+
+    @staticmethod
+    def get_eplb_moe_model(model):
+        if hasattr(model, "get_language_model"):
+            language_model = model.get_language_model()
+            if language_model is not None:
+                return language_model
+        return getattr(model, "language_model", model)
 
     def init_buffer_tensor(self, num_buffer_tensor):
         for buffer_id in range(num_buffer_tensor):
             for name in self.expert_weight_names:
                 complete_name = "model.layers." + str(
                     self.num_dense_layers) + ".mlp.experts." + name
-                if name in [
+                if self.use_list_expert_weights and name in [
                         "w13_weight_list", "w2_weight_list",
                         "w13_weight_scale_fp32_list", "w2_weight_scale_list",
                         "w2_weight_scale_fp32_list"
@@ -91,20 +133,28 @@ class VllmEplbAdaptor(EplbAdaptor):
                     expert_tensor = self.param_dict[complete_name][0]
                     expert_tensor = expert_tensor.clone()
                 else:
-                    expert_tensor = self.param_dict[complete_name][0].data[0]
+                    if self.use_list_expert_weights:
+                        expert_tensor = self.param_dict[complete_name][0].data[
+                            0]
+                    else:
+                        # tensor mode: [num_local_experts, ...]
+                        expert_tensor = self.param_dict[complete_name].data[0]
                 buffer_tensor = torch.empty_like(expert_tensor)
                 self.buffer_tensor_list[buffer_id].append(buffer_tensor)
 
     def init_expert_param_per_layer(self):
         key = f"model.layers.{self.num_dense_layers}.mlp.experts.{self.expert_weight_names[0]}"
-        num_local_expert = len(self.param_dict[key])
+        if self.use_list_expert_weights:
+            num_local_expert = len(self.param_dict[key])
+        else:
+            num_local_expert = self.param_dict[key].shape[0]
         for moe_layer_id in range(self.num_moe_layers):
             layer_idx = self.num_dense_layers + moe_layer_id
             self.expert_param_per_layer[layer_idx] = list()
             for local_expert_id in range(num_local_expert):
                 per_expert_param = list()
                 for name in self.expert_weight_names:
-                    if name in [
+                    if self.use_list_expert_weights and name in [
                             "w13_weight_list", "w2_weight_list",
                             "w13_weight_scale_fp32_list",
                             "w2_weight_scale_list", "w2_weight_scale_fp32_list"
@@ -114,14 +164,25 @@ class VllmEplbAdaptor(EplbAdaptor):
                                             ".mlp.experts." +
                                             name][local_expert_id])
                     else:
-                        per_expert_param.append(
-                            self.param_dict["model.layers." + str(layer_idx) +
-                                            ".mlp.experts." +
-                                            name][0].data[local_expert_id])
+                        if self.use_list_expert_weights:
+                            per_expert_param.append(
+                                self.param_dict["model.layers." +
+                                                str(layer_idx) +
+                                                ".mlp.experts." +
+                                                name][0].data[local_expert_id])
+                        else:
+                            # tensor mode: index by local expert directly.
+                            per_expert_param.append(
+                                self.param_dict["model.layers." +
+                                                str(layer_idx) +
+                                                ".mlp.experts." +
+                                                name].data[local_expert_id])
                 self.expert_param_per_layer[layer_idx].append(per_expert_param)
 
     def get_rank_expert_workload(self) -> torch.Tensor:
         self.moe_load = self.model.get_all_moe_loads()
+        logger.debug("EPLB collected moe load for %d layers",
+                     self.num_moe_layers)
         return self.moe_load
 
     def _export_tensor_to_file(self, expert_maps, expert_map_record_path: str):
@@ -174,11 +235,13 @@ class VllmEplbAdaptor(EplbAdaptor):
     def get_global_expert_map(self):
         all_layer_global_expert_map = []
         for layer_id in range(self.num_moe_layers):
-            map_cpu = self.model.model.layers[
+            map_cpu = self.moe_model.model.layers[
                 self.num_dense_layers +
                 layer_id].mlp.experts.global_expert_map.cpu()
             all_layer_global_expert_map.append(map_cpu)
             self.expert_map_per_layer_cpu[self.num_dense_layers +
                                           layer_id] = map_cpu[self.rank_id]
 
+        logger.debug("EPLB global expert map prepared for %d layers",
+                     self.num_moe_layers)
         return torch.stack(all_layer_global_expert_map)
