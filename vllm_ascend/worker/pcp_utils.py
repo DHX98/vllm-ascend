@@ -31,6 +31,101 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
+def build_dual_chunk_swap_plan(
+    query_lens: np.ndarray,
+    group_size: int,
+    rank: int,
+    decode_threshold: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build a DualChunkSwap plan that can be reused by PCP/TP call sites.
+
+    Args:
+        query_lens: Number of scheduled query tokens per request.
+        group_size: Parallel group size to split each request.
+        rank: Local rank inside the group.
+        decode_threshold: Requests whose query len is <= threshold are treated
+            as decode-style segments (duplicated per rank for PCP semantics).
+
+    Returns:
+        local_positions: Flattened local token positions on this rank in the
+            padded per-request layout.
+        restore_idx: Global restore indices after all-gather across ranks.
+        pads: Extra padded/duplicated token count per request.
+        unpad_mask: Boolean mask for local_positions indicating real tokens.
+    """
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+    if rank < 0 or rank >= group_size:
+        raise ValueError(f"rank must be in [0, {group_size}), got {rank}")
+
+    query_lens = np.asarray(query_lens, dtype=np.int64)
+    if query_lens.size == 0:
+        empty = np.array([], dtype=np.int32)
+        return empty, empty, empty, np.array([], dtype=bool)
+
+    padded_lens = np.ceil(query_lens / (2 * group_size)).astype(np.int64) * (2 * group_size)
+    is_decode_req = query_lens <= decode_threshold
+    if np.any(is_decode_req):
+        padded_lens[is_decode_req] = query_lens[is_decode_req] * group_size
+
+    request_offsets = np.roll(np.cumsum(padded_lens), 1)
+    request_offsets[0] = 0
+
+    local_positions_per_req: list[np.ndarray] = []
+    local_unpad_masks: list[np.ndarray] = []
+    for req_idx, req_len in enumerate(query_lens):
+        req_len = int(req_len)
+        req_offset = int(request_offsets[req_idx])
+        req_padded_len = int(padded_lens[req_idx])
+
+        if req_len <= decode_threshold:
+            req_positions = req_offset + rank * req_len + np.arange(req_len, dtype=np.int64)
+            req_unpad_mask = np.ones(req_len, dtype=bool)
+            if rank != 0:
+                # Decode requests are duplicated across ranks for PCP. Keep only
+                # rank-0 as valid tokens in the unpad path.
+                req_unpad_mask[:] = False
+        else:
+            chunk_len = req_padded_len // (2 * group_size)
+            head = req_offset + rank * chunk_len + np.arange(chunk_len, dtype=np.int64)
+            tail = req_offset + (2 * group_size - rank - 1) * chunk_len + np.arange(chunk_len, dtype=np.int64)
+            req_positions = np.concatenate([head, tail], axis=0)
+            req_unpad_mask = (req_positions - req_offset) < req_len
+
+        local_positions_per_req.append(req_positions)
+        local_unpad_masks.append(req_unpad_mask)
+
+    local_positions = np.concatenate(local_positions_per_req, axis=0)
+    unpad_mask = np.concatenate(local_unpad_masks, axis=0)
+
+    all_positions: list[np.ndarray] = []
+    for rank_i in range(group_size):
+        rank_positions_per_req: list[np.ndarray] = []
+        for req_idx, req_len in enumerate(query_lens):
+            req_len = int(req_len)
+            req_offset = int(request_offsets[req_idx])
+            req_padded_len = int(padded_lens[req_idx])
+            if req_len <= decode_threshold:
+                req_positions = req_offset + rank_i * req_len + np.arange(req_len, dtype=np.int64)
+            else:
+                chunk_len = req_padded_len // (2 * group_size)
+                head = req_offset + rank_i * chunk_len + np.arange(chunk_len, dtype=np.int64)
+                tail = req_offset + (2 * group_size - rank_i - 1) * chunk_len + np.arange(chunk_len, dtype=np.int64)
+                req_positions = np.concatenate([head, tail], axis=0)
+            rank_positions_per_req.append(req_positions)
+        all_positions.append(np.concatenate(rank_positions_per_req, axis=0))
+
+    restore_idx = np.concatenate(all_positions, axis=0).argsort(kind="stable")
+    pads = padded_lens - query_lens
+
+    return (
+        local_positions.astype(np.int32),
+        restore_idx.astype(np.int32),
+        pads.astype(np.int32),
+        unpad_mask,
+    )
+
+
 class PCPManager:
     """
     Manager for Prefill Context Parallelism (PCP) metadata and buffers.

@@ -1090,17 +1090,21 @@ def singleton(cls):
     return get_instance
 
 
-# TODO: Temporarily use enable_sp to enable the dsa_cp feature of ds32.
-# and subsequent updates will introduce new interfaces. --zzhx1
+def _supports_dsa_cp(vllm_config) -> bool:
+    hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", "")
+    has_deepseek_dsa_capability = hf_text_config is not None and hasattr(hf_text_config, "index_topk")
+    has_glm_dsa_capability = model_type == "glm_moe_dsa"
+    return bool(has_deepseek_dsa_capability or has_glm_dsa_capability)
+
+
 @lru_cache(maxsize=1)
 def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
-    is_ds_v32 = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
-        vllm_config.model_config.hf_text_config, "index_topk"
-    )
-    return bool(is_ds_v32 and enable_sp())
+    return bool(_supports_dsa_cp(vllm_config) and enable_sp())
 
 
 @lru_cache(maxsize=1)
@@ -1112,6 +1116,29 @@ def enable_dsa_cp_with_layer_shard() -> bool:
     vllm_config = get_current_vllm_config()
     is_prefill_instance = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_producer
     return is_prefill_instance
+
+
+@lru_cache(maxsize=1)
+def enable_lightning_indexer_skip() -> bool:
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    additional_config = vllm_config.additional_config or {}
+    enabled = additional_config.get(
+        "lightning_indexer_skip",
+        additional_config.get("enable_lightning_indexer_skip", False),
+    )
+    return bool(_supports_dsa_cp(vllm_config) and enabled)
+
+
+@lru_cache(maxsize=1)
+def get_lightning_indexer_skip_threshold() -> int:
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    additional_config = vllm_config.additional_config or {}
+    threshold = int(additional_config.get("lightning_indexer_skip_threshold", 2048))
+    return max(threshold, 0)
 
 
 def check_gdn_layer(vllm_config) -> bool:

@@ -17,7 +17,35 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.pcp_utils import PCPManager, build_dual_chunk_swap_plan
+
+
+def test_build_dual_chunk_swap_plan_prefill():
+    local_positions, restore_idx, pads, unpad_mask = build_dual_chunk_swap_plan(
+        query_lens=np.array([5], dtype=np.int32),
+        group_size=2,
+        rank=0,
+        decode_threshold=1,
+    )
+
+    assert np.array_equal(local_positions, np.array([0, 1, 6, 7], dtype=np.int32))
+    assert np.array_equal(restore_idx, np.array([0, 1, 4, 5, 6, 7, 2, 3], dtype=np.int32))
+    assert np.array_equal(pads, np.array([3], dtype=np.int32))
+    assert np.array_equal(unpad_mask, np.array([True, True, False, False]))
+
+
+def test_build_dual_chunk_swap_plan_decode_and_prefill():
+    local_positions, restore_idx, pads, unpad_mask = build_dual_chunk_swap_plan(
+        query_lens=np.array([1, 4], dtype=np.int32),
+        group_size=2,
+        rank=1,
+        decode_threshold=1,
+    )
+
+    assert np.array_equal(local_positions, np.array([1, 3, 4], dtype=np.int32))
+    assert np.array_equal(restore_idx, np.array([0, 3, 1, 4, 5, 2], dtype=np.int32))
+    assert np.array_equal(pads, np.array([1, 0], dtype=np.int32))
+    assert np.array_equal(unpad_mask, np.array([False, True, True]))
 
 
 @pytest.mark.parametrize(

@@ -87,7 +87,15 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    AscendLightningIndexerMetadata,
+    get_index_of_skipped_queries_numpy,
+    get_sfa_skip_indices,
+    hidden_states_reorder,
+    maybe_pad_and_reorder_inputs,
+    using_paged_attention,
+)
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -113,8 +121,10 @@ from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.utils import (
     check_gdn_layer,
+    enable_lightning_indexer_skip,
     enable_sp,
     enable_sp_by_pass,
+    get_lightning_indexer_skip_threshold,
     is_drafter_moe_model,
     is_moe_model,
     lmhead_tp_enable,
@@ -385,6 +395,10 @@ class NPUModelRunner(GPUModelRunner):
         self.long_seq_metadata = None
         self.query_lens: torch.Tensor | None = None
         self.cpu_slot_mapping = None
+
+        self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
+        self.lightning_indexer_skip_threshold = get_lightning_indexer_skip_threshold()
+        self.lightning_indexer_metadata: AscendLightningIndexerMetadata | None = None
 
     @property
     def use_cp(self) -> bool:
@@ -1223,31 +1237,68 @@ class NPUModelRunner(GPUModelRunner):
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-                if (
-                    cudagraph_mode == CUDAGraphMode.FULL
-                    or (enable_sp() and not self.model_config.use_mla)
-                    and self.pcp_size == 1  # TODO(lxs): fix this
-                ):
-                    # Currently, Graph Mode and SP will both pad num_tokens,
-                    # Another possible condition is num_tokens_padded != num_tokens_unpadded
-                    # but this scope is way too big and the consequences are unpredictable
-                    num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
-
-                (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded
-                    if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
-                    else total_num_scheduled_tokens,
-                    num_tokens_padded=num_tokens_padded,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+            if self.enable_lightning_indexer_skip:
+                li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skipped_query_mask = get_sfa_skip_indices(
+                    self.input_batch.num_computed_tokens_cpu,
+                    num_scheduled_tokens_np,
+                    skip_threshold=self.lightning_indexer_skip_threshold,
                 )
+
+                if li_reorder_indices is not None:
+                    top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
+                        li_cum_query_lens,
+                        li_seq_lens,
+                        num_reqs,
+                        2048,
+                    )
+                    self.lightning_indexer_metadata = AscendLightningIndexerMetadata(
+                        li_reorder_indices=torch.from_numpy(li_reorder_indices)
+                        .pin_memory()
+                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                        li_cum_query_lens=torch.from_numpy(li_cum_query_lens)
+                        .pin_memory()
+                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                        li_seq_lens=torch.from_numpy(li_seq_lens)
+                        .pin_memory()
+                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                        li_skip_request_mask=torch.from_numpy(li_skipped_query_mask)
+                        .pin_memory()
+                        .to(dtype=torch.bool, device=self.device, non_blocking=True),
+                        top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
+                        .pin_memory()
+                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                        skip_threshold=self.lightning_indexer_skip_threshold,
+                    )
+                else:
+                    self.lightning_indexer_metadata = None
+            else:
+                self.lightning_indexer_metadata = None
+
+            if (
+                cudagraph_mode == CUDAGraphMode.FULL
+                or (enable_sp() and not self.model_config.use_mla)
+                and self.pcp_size == 1  # TODO(lxs): fix this
+            ):
+                # Currently, Graph Mode and SP will both pad num_tokens,
+                # Another possible condition is num_tokens_padded != num_tokens_unpadded
+                # but this scope is way too big and the consequences are unpredictable
+                num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
+
+            (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
+                num_tokens=num_tokens_unpadded
+                if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                else total_num_scheduled_tokens,
+                num_tokens_padded=num_tokens_padded,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                max_query_len=max_num_scheduled_tokens,
+                ubatch_slices=ubatch_slices_attn,
+                logits_indices=logits_indices,
+                use_spec_decode=use_spec_decode,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+            )
 
             (
                 input_ids,
@@ -1314,9 +1365,18 @@ class NPUModelRunner(GPUModelRunner):
             ),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            if self.enable_lightning_indexer_skip and self.lightning_indexer_metadata is not None:
+                input_ids, positions = maybe_pad_and_reorder_inputs(
+                    input_ids, positions, self.lightning_indexer_metadata.li_reorder_indices
+                )
+
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+
+            if self.enable_lightning_indexer_skip and self.lightning_indexer_metadata is not None:
+                hidden_states = hidden_states_reorder(hidden_states, self.lightning_indexer_metadata.li_reorder_indices)
+
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2011,6 +2071,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
+            lightning_indexer_metadata=self.lightning_indexer_metadata,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
