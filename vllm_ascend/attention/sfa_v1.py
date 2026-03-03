@@ -1143,20 +1143,29 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Save TP-mode parameters (original sharded weights)
         self.o_proj_tp_weight = self.o_proj.weight.clone().detach()
-        self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone().detach()
-        self.o_proj_tp_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.clone().detach()
-        self.o_proj_tp_aclnn_input_offset = self.o_proj.aclnn_input_offset.clone().detach()
+        self.o_proj_has_aclnn_params = all(
+            hasattr(self.o_proj, name)
+            for name in ("aclnn_input_scale", "aclnn_input_scale_reciprocal", "aclnn_input_offset")
+        )
+        if self.o_proj_has_aclnn_params:
+            self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone().detach()
+            self.o_proj_tp_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.clone().detach()
+            self.o_proj_tp_aclnn_input_offset = self.o_proj.aclnn_input_offset.clone().detach()
 
         # Initially switch to TP mode for graph capture
         self.o_proj.weight.set_(self.o_proj_tp_weight)
-        self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
-        self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
-        self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
+        if self.o_proj_has_aclnn_params:
+            self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
+            self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
+            self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
 
         # Precompute Full-mode quantization parameters by repeating TP parameters across all TP ranks
-        self.o_proj_full_aclnn_input_scale = self.o_proj.aclnn_input_scale.repeat(self.tp_size)
-        self.o_proj_full_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.repeat(self.tp_size)
-        self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(self.tp_size)
+        if self.o_proj_has_aclnn_params:
+            self.o_proj_full_aclnn_input_scale = self.o_proj.aclnn_input_scale.repeat(self.tp_size)
+            self.o_proj_full_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.repeat(
+                self.tp_size
+            )
+            self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(self.tp_size)
 
     def _handle_o_proj_weight_switch_and_forward(
         self,
@@ -1176,18 +1185,20 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             # Switch o_proj to Full-mode (gathered weight from all TP ranks)
             self.o_proj.weight.set_(AscendSFAImpl.o_proj_full_pool)
-            self.o_proj.aclnn_input_scale.set_(self.o_proj_full_aclnn_input_scale)
-            self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_full_aclnn_input_scale_reciprocal)
-            self.o_proj.aclnn_input_offset.set_(self.o_proj_full_aclnn_input_offset)
+            if self.o_proj_has_aclnn_params:
+                self.o_proj.aclnn_input_scale.set_(self.o_proj_full_aclnn_input_scale)
+                self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_full_aclnn_input_scale_reciprocal)
+                self.o_proj.aclnn_input_offset.set_(self.o_proj_full_aclnn_input_offset)
 
             # Apply quantization method and execute forward computation
             output[...] = self.o_proj.quant_method.quant_method.apply(self.o_proj, attn_output)
 
             # Switch o_proj back to TP-mode for subsequent decode operations
             self.o_proj.weight.set_(self.o_proj_tp_weight)
-            self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
-            self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
-            self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
+            if self.o_proj_has_aclnn_params:
+                self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
+                self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
+                self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
 
             return output, False
         else:
