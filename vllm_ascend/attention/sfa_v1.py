@@ -450,7 +450,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self.enable_dsa_cp = enable_dsa_cp()
         self.enable_dsa_cp_prefill_only = enable_dsa_cp_with_layer_shard()
-        self.o_proj_has_aclnn_params = False
         if self.enable_dsa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
             logger.info_once(
@@ -1159,6 +1158,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendSFAImpl.o_proj_full_pool = torch.empty(
                 (sample.shape[0] * self.tp_size, sample.shape[1]), dtype=sample.dtype, device=sample.device
             )
+
+        # OOT registration can leave row-parallel linears without having run
+        # AscendRowParallelLinear.__init__, so materialize the contract here too.
+        self.o_proj._ensure_aclnn_input_metadata_buffers()
 
         # Save TP-mode parameters (original sharded weights)
         self.o_proj_tp_weight = self.o_proj.weight.clone().detach()

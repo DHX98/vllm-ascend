@@ -307,16 +307,25 @@ class AscendRowParallelLinear(RowParallelLinear):
             self.custom_op.update_attrs()
 
     def _ensure_aclnn_input_metadata_buffers(self) -> None:
-        default_scale = torch.ones(1, dtype=self.params_dtype)
-        default_reciprocal = torch.ones(1, dtype=self.params_dtype)
-        default_offset = torch.zeros(1, dtype=self.params_dtype)
+        default_device = self.weight.device
+        default_scale = torch.ones(1, dtype=self.params_dtype, device=default_device)
+        default_reciprocal = torch.ones(1, dtype=self.params_dtype, device=default_device)
+        default_offset = torch.zeros(1, dtype=self.params_dtype, device=default_device)
         for buffer_name, default_value in (
             ("aclnn_input_scale", default_scale),
             ("aclnn_input_scale_reciprocal", default_reciprocal),
             ("aclnn_input_offset", default_offset),
         ):
-            if hasattr(self, buffer_name):
+            current_value = getattr(self, buffer_name, None)
+            if current_value is not None:
                 continue
+            if buffer_name in self._buffers:
+                self._buffers[buffer_name] = default_value
+                continue
+            if buffer_name in self._parameters:
+                self._parameters.pop(buffer_name)
+            elif hasattr(self, buffer_name):
+                delattr(self, buffer_name)
             self.register_buffer(buffer_name, default_value, persistent=False)
 
     def forward(
