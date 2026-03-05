@@ -279,3 +279,20 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+
+
+def test_init_o_proj_tp_full_params_without_aclnn_params():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.tp_size = 2
+    impl.o_proj = MagicMock()
+    impl.o_proj.weight = torch.randn(4, 8)
+
+    origin_pool = AscendSFAImpl.o_proj_full_pool
+    AscendSFAImpl.o_proj_full_pool = None
+    try:
+        impl._init_o_proj_tp_full_params()
+    finally:
+        AscendSFAImpl.o_proj_full_pool = origin_pool
+
+    assert impl.o_proj_has_aclnn_params is False
+    assert hasattr(impl, "o_proj_tp_weight")

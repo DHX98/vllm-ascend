@@ -373,6 +373,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     # Supports forward using the all-gather o_proj weight for decode requests when Sharded CP is enabled.
     o_proj_full_pool: torch.Tensor | None = None
+    _logged_li_skip_runtime_path = False
+    _logged_o_proj_switch_runtime_path = False
 
     def __init__(
         self,
@@ -448,8 +450,16 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self.enable_dsa_cp = enable_dsa_cp()
         self.enable_dsa_cp_prefill_only = enable_dsa_cp_with_layer_shard()
+        self.o_proj_has_aclnn_params = False
         if self.enable_dsa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
+            logger.info_once(
+                "[DSA-CP option2] enable_dsa_cp=True, model_type=%s, "
+                "lightning_indexer_skip=%s, use_torch_npu_lightning_indexer=%s",
+                self.vllm_config.model_config.hf_config.model_type,
+                self.enable_lightning_indexer_skip,
+                self.use_torch_npu_lightning_indexer,
+            )
         if self.enable_dsa_cp_prefill_only:
             self.layer_sharding_kwargs = []
             for layer_name in get_ascend_config().layer_sharding or []:
@@ -1090,6 +1100,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             and num_seqs > 0
             and num_seqs < actual_seq_lengths_key.shape[0]
         )
+        if self.enable_lightning_indexer_skip and not AscendSFAImpl._logged_li_skip_runtime_path:
+            logger.info(
+                "[DSA-CP option2] lightning_indexer_skip runtime path hit: "
+                "num_seqs=%d, num_tokens=%d, has_skip_suffix=%s",
+                num_seqs,
+                num_tokens,
+                has_skip_suffix,
+            )
+            AscendSFAImpl._logged_li_skip_runtime_path = True
         if self.enable_lightning_indexer_skip:
             if num_tokens > 0:
                 topk_indices_no_skip = run_lightning_indexer(
@@ -1143,14 +1162,30 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Save TP-mode parameters (original sharded weights)
         self.o_proj_tp_weight = self.o_proj.weight.clone().detach()
-        self.o_proj_has_aclnn_params = all(
-            hasattr(self.o_proj, name)
-            for name in ("aclnn_input_scale", "aclnn_input_scale_reciprocal", "aclnn_input_offset")
+        try:
+            aclnn_input_scale = self.o_proj.aclnn_input_scale
+            aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal
+            aclnn_input_offset = self.o_proj.aclnn_input_offset
+            self.o_proj_has_aclnn_params = (
+                aclnn_input_scale is not None
+                and aclnn_input_scale_reciprocal is not None
+                and aclnn_input_offset is not None
+            )
+        except AttributeError:
+            self.o_proj_has_aclnn_params = False
+        logger.info_once(
+            "[DSA-CP option2] initialized o_proj TP/full switch buffers: tp_size=%d, has_aclnn_params=%s",
+            self.tp_size,
+            self.o_proj_has_aclnn_params,
         )
+        if not self.o_proj_has_aclnn_params:
+            logger.warning_once(
+                "[DSA-CP option2] o_proj has no aclnn_* params, skip aclnn scale/offset switching."
+            )
         if self.o_proj_has_aclnn_params:
-            self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone().detach()
-            self.o_proj_tp_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.clone().detach()
-            self.o_proj_tp_aclnn_input_offset = self.o_proj.aclnn_input_offset.clone().detach()
+            self.o_proj_tp_aclnn_input_scale = aclnn_input_scale.clone().detach()
+            self.o_proj_tp_aclnn_input_scale_reciprocal = aclnn_input_scale_reciprocal.clone().detach()
+            self.o_proj_tp_aclnn_input_offset = aclnn_input_offset.clone().detach()
 
         # Initially switch to TP mode for graph capture
         self.o_proj.weight.set_(self.o_proj_tp_weight)
@@ -1161,11 +1196,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Precompute Full-mode quantization parameters by repeating TP parameters across all TP ranks
         if self.o_proj_has_aclnn_params:
-            self.o_proj_full_aclnn_input_scale = self.o_proj.aclnn_input_scale.repeat(self.tp_size)
-            self.o_proj_full_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.repeat(
-                self.tp_size
-            )
-            self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(self.tp_size)
+            self.o_proj_full_aclnn_input_scale = aclnn_input_scale.repeat(self.tp_size)
+            self.o_proj_full_aclnn_input_scale_reciprocal = aclnn_input_scale_reciprocal.repeat(self.tp_size)
+            self.o_proj_full_aclnn_input_offset = aclnn_input_offset.repeat(self.tp_size)
 
     def _handle_o_proj_weight_switch_and_forward(
         self,
@@ -1178,6 +1211,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         Handle o_proj weight switching between TP-mode and Full-mode, and execute forward computation.
         """
         # Gather o_proj weight from all TP ranks for Full-mode computation
+        if not AscendSFAImpl._logged_o_proj_switch_runtime_path:
+            logger.info(
+                "[DSA-CP option2] o_proj switch runtime path hit: should_shard_weight=%s, has_aclnn_params=%s",
+                should_shard_weight,
+                self.o_proj_has_aclnn_params,
+            )
+            AscendSFAImpl._logged_o_proj_switch_runtime_path = True
         if should_shard_weight:
             # Wait for the completion of o_proj weight all-gather operation
             if o_proj_full_handle is not None:
