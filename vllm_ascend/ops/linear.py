@@ -301,8 +301,23 @@ class AscendRowParallelLinear(RowParallelLinear):
         else:
             self.register_parameter("bias", None)
 
+        self._ensure_aclnn_input_metadata_buffers()
+
         if self.custom_op is not None:
             self.custom_op.update_attrs()
+
+    def _ensure_aclnn_input_metadata_buffers(self) -> None:
+        default_scale = torch.ones(1, dtype=self.params_dtype)
+        default_reciprocal = torch.ones(1, dtype=self.params_dtype)
+        default_offset = torch.zeros(1, dtype=self.params_dtype)
+        for buffer_name, default_value in (
+            ("aclnn_input_scale", default_scale),
+            ("aclnn_input_scale_reciprocal", default_reciprocal),
+            ("aclnn_input_offset", default_offset),
+        ):
+            if hasattr(self, buffer_name):
+                continue
+            self.register_buffer(buffer_name, default_value, persistent=False)
 
     def forward(
         self,
