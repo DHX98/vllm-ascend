@@ -1245,6 +1245,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 if li_reorder_indices is not None:
+                    li_cum_query_lens_cpu = torch.from_numpy(li_cum_query_lens)
+                    li_seq_lens_cpu = torch.from_numpy(li_seq_lens)
                     top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
                         li_cum_query_lens,
                         li_seq_lens,
@@ -1255,18 +1257,21 @@ class NPUModelRunner(GPUModelRunner):
                         li_reorder_indices=torch.from_numpy(li_reorder_indices)
                         .pin_memory()
                         .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        li_cum_query_lens=torch.from_numpy(li_cum_query_lens)
+                        li_cum_query_lens=li_cum_query_lens_cpu
                         .pin_memory()
                         .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        li_seq_lens=torch.from_numpy(li_seq_lens)
+                        li_cum_query_lens_cpu=li_cum_query_lens_cpu,
+                        li_seq_lens=li_seq_lens_cpu
                         .pin_memory()
                         .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                        li_seq_lens_cpu=li_seq_lens_cpu,
                         li_skip_request_mask=torch.from_numpy(li_skipped_query_mask)
                         .pin_memory()
                         .to(dtype=torch.bool, device=self.device, non_blocking=True),
                         top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
                         .pin_memory()
                         .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                        num_actual_reqs=num_reqs,
                         skip_threshold=self.lightning_indexer_skip_threshold,
                     )
                 else:

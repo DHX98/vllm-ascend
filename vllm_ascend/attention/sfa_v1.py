@@ -227,16 +227,36 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         num_input_tokens = common_attn_metadata.num_input_tokens
 
-        block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
-
-        cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
+        block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        lightning_indexer_metadata = common_attn_metadata.lightning_indexer_metadata
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        cum_query_lens_cpu = query_start_loc_cpu[1 : num_reqs + 1]
+        cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
+        cum_query_lens_cpu_for_dsa_cp = query_start_loc_cpu[1 : num_reqs + 1]
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        seq_lens_cpu_for_dsa_cp = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))
+        top_k_indices_skip_li_query = None
+        if self.enable_lightning_indexer_skip and lightning_indexer_metadata is not None:
+            num_actual_seqs = lightning_indexer_metadata.num_actual_reqs
+            li_reorder_indices = lightning_indexer_metadata.li_reorder_indices.to(dtype=torch.int64)
+            input_positions_pad = torch.zeros_like(input_positions)
+            input_positions_pad[:num_actual_tokens] = torch.index_select(input_positions, 0, li_reorder_indices)
+            slot_mapping_pad = torch.full_like(slot_mapping, -1)
+            slot_mapping_pad[:num_actual_tokens] = torch.index_select(slot_mapping, 0, li_reorder_indices)
+
+            input_positions = input_positions_pad
+            slot_mapping = slot_mapping_pad
+            cum_query_lens = lightning_indexer_metadata.li_cum_query_lens
+            seq_lens = lightning_indexer_metadata.li_seq_lens
+            cum_query_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_cum_query_lens_cpu[:num_actual_seqs]
+            seq_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_seq_lens_cpu[:num_actual_seqs]
+            block_table = common_attn_metadata.block_table_tensor[:num_actual_seqs]
+            li_skip_request_mask = lightning_indexer_metadata.li_skip_request_mask
+            block_table = torch.cat([block_table, block_table[li_skip_request_mask]], dim=0)
+            top_k_indices_skip_li_query = lightning_indexer_metadata.top_k_indices_of_skipped_queries
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
@@ -284,12 +304,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_seq_lengths_query = self.actual_seq_lengths_query
             actual_seq_lengths_key = self.actual_seq_lengths_key
 
-            num_segs = cum_query_lens.shape[0]
+            num_segs = num_actual_seqs
             last_token = 0
             cum = 0
             for i in range(0, num_segs):
                 global_start = last_token
-                global_end = int(cum_query_lens_cpu[i])
+                global_end = int(cum_query_lens_cpu_for_dsa_cp[i])
                 last_token = global_end
 
                 req_local_start = max(global_start, local_start)
@@ -301,13 +321,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     actual_seq_lengths_query[i] = cum
 
                     offset = global_end - req_local_end
-                    actual_seq_lengths_key[i] = int(seq_lens_cpu[i]) - offset
+                    actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
                 else:
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
 
-            actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
-            actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
+            actual_seq_lengths_query = actual_seq_lengths_query[:num_actual_seqs]
+            actual_seq_lengths_key = actual_seq_lengths_key[:num_actual_seqs]
             num_local_query_tokens = cum
 
             dsa_cp_context = DSACPContext(
@@ -320,26 +340,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
-
-        top_k_indices_skip_li_query = None
-        num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))
-        lightning_indexer_metadata = common_attn_metadata.lightning_indexer_metadata
-        if self.enable_lightning_indexer_skip and lightning_indexer_metadata is not None:
-            li_reorder_indices = lightning_indexer_metadata.li_reorder_indices.to(dtype=torch.int64)
-            input_positions_pad = torch.zeros_like(input_positions)
-            input_positions_pad[:num_actual_tokens] = torch.index_select(input_positions, 0, li_reorder_indices)
-            slot_mapping_pad = torch.full_like(slot_mapping, -1)
-            slot_mapping_pad[:num_actual_tokens] = torch.index_select(slot_mapping, 0, li_reorder_indices)
-
-            cum_query_lens = lightning_indexer_metadata.li_cum_query_lens
-            seq_lens = lightning_indexer_metadata.li_seq_lens
-            li_skip_request_mask = lightning_indexer_metadata.li_skip_request_mask
-            base_block_table = block_table[: li_skip_request_mask.shape[0]]
-            block_table = torch.cat([base_block_table, base_block_table[li_skip_request_mask]], dim=0)
-            slot_mapping = slot_mapping_pad
-            input_positions = input_positions_pad
-            cos, sin = get_cos_and_sin_mla(input_positions, True)
-            top_k_indices_skip_li_query = lightning_indexer_metadata.top_k_indices_of_skipped_queries
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,

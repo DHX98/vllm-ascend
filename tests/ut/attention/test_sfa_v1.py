@@ -348,9 +348,12 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.lightning_indexer_metadata = AscendLightningIndexerMetadata(
             li_reorder_indices=torch.tensor([0], dtype=torch.int32),
             li_cum_query_lens=torch.tensor([0, 1], dtype=torch.int32),
+            li_cum_query_lens_cpu=torch.tensor([0, 1], dtype=torch.int32),
             li_seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            li_seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
             li_skip_request_mask=torch.tensor([True], dtype=torch.bool),
             top_k_indices_of_skipped_queries=torch.full((1, 1, 2048), -1, dtype=torch.int32),
+            num_actual_reqs=1,
         )
 
         mock_get_cos_and_sin_mla.return_value = (
@@ -363,6 +366,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             common_attn_metadata=common_attn_metadata,
         )
 
+        assert metadata.num_actual_seqs == 1
         assert metadata.block_table.shape == (2, 2)
         assert torch.equal(metadata.block_table[0], common_attn_metadata.block_table_tensor[0])
         assert torch.equal(metadata.block_table[1], common_attn_metadata.block_table_tensor[0])

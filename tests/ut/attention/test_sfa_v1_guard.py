@@ -25,6 +25,9 @@ def test_sfa_skip_topk_alignment_uses_local_query_tokens_without_device_sync():
     assert "actual_seq_lengths_query[num_seqs - 1].item()" not in source
     assert "actual_seq_lengths_query[-1].item()" not in source
     assert "query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]" in source
-    assert "num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))" in source
-    assert "base_block_table = block_table[: li_skip_request_mask.shape[0]]" in source
-    assert "torch.cat([base_block_table, base_block_table[li_skip_request_mask]], dim=0)" in source
+    assert "num_actual_seqs = lightning_indexer_metadata.num_actual_reqs" in source
+    assert "cum_query_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_cum_query_lens_cpu[:num_actual_seqs]" in source
+    assert "seq_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_seq_lens_cpu[:num_actual_seqs]" in source
+    assert "block_table = common_attn_metadata.block_table_tensor[:num_actual_seqs]" in source
+    assert "torch.cat([block_table, block_table[li_skip_request_mask]], dim=0)" in source
+    assert source.index("input_positions = input_positions_pad") < source.index("cos, sin = get_cos_and_sin_mla(input_positions, True)")

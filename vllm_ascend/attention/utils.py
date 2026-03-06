@@ -122,9 +122,12 @@ class AscendPrefillContextParallelMetadata:
 class AscendLightningIndexerMetadata:
     li_reorder_indices: torch.Tensor = None
     li_cum_query_lens: torch.Tensor = None
+    li_cum_query_lens_cpu: torch.Tensor = None
     li_seq_lens: torch.Tensor = None
+    li_seq_lens_cpu: torch.Tensor = None
     li_skip_request_mask: torch.Tensor = None
     top_k_indices_of_skipped_queries: torch.Tensor = None
+    num_actual_reqs: int = 0
     skip_threshold: int = 2048
 
 
