@@ -6,6 +6,7 @@ import torch
 from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import AscendLightningIndexerMetadata
 from vllm.distributed.parallel_state import GroupCoordinator
 
 if 'torch_npu._inductor' not in sys.modules:
@@ -290,6 +291,81 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert metadata.num_actual_seqs == 1
         assert metadata.num_local_query_tokens == 1
         assert torch.equal(metadata.cum_query_lens, common_attn_metadata.query_start_loc[1:9])
+
+    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
+    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
+    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")
+    @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
+    def test_ascend_sfa_metadata_builder_uses_unpadded_block_table_for_skip_metadata(
+        self,
+        mock_enable_dsa_cp,
+        mock_get_cos_and_sin_mla,
+        mock_get_current_vllm_config,
+    ):
+        mock_enable_dsa_cp.return_value = False
+
+        cfg = MagicMock()
+        cfg.model_config = MagicMock()
+        cfg.model_config.hf_text_config = MagicMock()
+        mock_get_current_vllm_config.return_value = cfg
+
+        kv_cache_spec = MagicMock()
+        layer_names = ["layer1", "layer2"]
+        vllm_config = MagicMock()
+        vllm_config.cache_config.block_size = 16
+        vllm_config.model_config.max_model_len = 1024
+        vllm_config.model_config.get_head_size.return_value = 64
+        vllm_config.model_config.dtype = torch.float16
+        vllm_config.model_config.hf_text_config.qk_rope_head_dim = 64
+        speculative_config = MagicMock()
+        speculative_config.num_speculative_tokens = 4
+        vllm_config.speculative_config = speculative_config
+        device = torch.device("cpu")
+
+        builder = AscendSFAMetadataBuilder(kv_cache_spec=kv_cache_spec,
+                                           layer_names=layer_names,
+                                           vllm_config=vllm_config,
+                                           device=device)
+        builder.enable_lightning_indexer_skip = True
+
+        common_attn_metadata = MagicMock()
+        common_attn_metadata.num_reqs = 8
+        common_attn_metadata.num_actual_tokens = 1
+        common_attn_metadata.num_input_tokens = 8
+        common_attn_metadata.query_start_loc = torch.tensor(
+            [0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int32)
+        common_attn_metadata.query_start_loc_cpu = torch.tensor(
+            [0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int32)
+        common_attn_metadata.slot_mapping = torch.arange(8, dtype=torch.int32)
+        common_attn_metadata.seq_lens = torch.tensor([1] * 8, dtype=torch.int32)
+        common_attn_metadata.seq_lens_cpu = torch.tensor([1] * 8, dtype=torch.int32)
+        common_attn_metadata.positions = torch.arange(8, dtype=torch.int64)
+        common_attn_metadata.attn_mask = None
+        common_attn_metadata.attn_state = AscendAttentionState.DecodeOnly
+        common_attn_metadata.block_table_tensor = torch.arange(16, dtype=torch.int32).view(8, 2)
+        common_attn_metadata.cos = None
+        common_attn_metadata.sin = None
+        common_attn_metadata.lightning_indexer_metadata = AscendLightningIndexerMetadata(
+            li_reorder_indices=torch.tensor([0], dtype=torch.int32),
+            li_cum_query_lens=torch.tensor([0, 1], dtype=torch.int32),
+            li_seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            li_skip_request_mask=torch.tensor([True], dtype=torch.bool),
+            top_k_indices_of_skipped_queries=torch.full((1, 1, 2048), -1, dtype=torch.int32),
+        )
+
+        mock_get_cos_and_sin_mla.return_value = (
+            torch.randn(8, 1, dtype=torch.float16),
+            torch.randn(8, 1, dtype=torch.float16),
+        )
+
+        metadata = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+        assert metadata.block_table.shape == (2, 2)
+        assert torch.equal(metadata.block_table[0], common_attn_metadata.block_table_tensor[0])
+        assert torch.equal(metadata.block_table[1], common_attn_metadata.block_table_tensor[0])
 
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")

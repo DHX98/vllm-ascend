@@ -334,7 +334,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cum_query_lens = lightning_indexer_metadata.li_cum_query_lens
             seq_lens = lightning_indexer_metadata.li_seq_lens
             li_skip_request_mask = lightning_indexer_metadata.li_skip_request_mask
-            block_table = torch.cat([block_table, block_table[li_skip_request_mask]], dim=0)
+            base_block_table = block_table[: li_skip_request_mask.shape[0]]
+            block_table = torch.cat([base_block_table, base_block_table[li_skip_request_mask]], dim=0)
             slot_mapping = slot_mapping_pad
             input_positions = input_positions_pad
             cos, sin = get_cos_and_sin_mla(input_positions, True)
