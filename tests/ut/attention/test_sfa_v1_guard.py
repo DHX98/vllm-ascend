@@ -17,8 +17,12 @@ def test_sfa_o_proj_switch_materializes_and_uses_direct_aclnn_contract():
     assert "self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone().detach()" in source
 
 
-def test_sfa_skip_topk_alignment_uses_cum_query_lens_tail():
+def test_sfa_skip_topk_alignment_uses_local_query_tokens_without_device_sync():
     source = Path("vllm_ascend/attention/sfa_v1.py").read_text()
 
-    assert "actual_query_tokens = int(actual_seq_lengths_query[-1].item())" in source
-    assert "align_topk_indices_to_actual_tokens(topk_indices, actual_query_tokens)" in source
+    assert "num_tokens = attn_metadata.num_local_query_tokens" in source
+    assert "align_topk_indices_to_actual_tokens(topk_indices, attn_metadata.num_local_query_tokens)" in source
+    assert "actual_seq_lengths_query[num_seqs - 1].item()" not in source
+    assert "actual_seq_lengths_query[-1].item()" not in source
+    assert "query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]" in source
+    assert "num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))" in source

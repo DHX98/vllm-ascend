@@ -144,6 +144,7 @@ class AscendSFAMetadata:
     num_decode_tokens: int = 0
     num_prefills: int = 0
     num_actual_seqs: int = 0
+    num_local_query_tokens: int = 0
     top_k_indices_skip_li_query: torch.Tensor | None = None
 
 
@@ -231,11 +232,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        cum_query_lens_cpu = query_start_loc_cpu[1 : num_reqs + 1]
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
         dsa_cp_context = None
+        num_local_query_tokens = num_actual_tokens
         if self.enable_dsa_cp:
             global_tp_size = get_tp_group().world_size
             num_tokens = num_input_tokens
@@ -283,7 +289,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cum = 0
             for i in range(0, num_segs):
                 global_start = last_token
-                global_end = cum_query_lens[i].item()
+                global_end = int(cum_query_lens_cpu[i])
                 last_token = global_end
 
                 req_local_start = max(global_start, local_start)
@@ -295,13 +301,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     actual_seq_lengths_query[i] = cum
 
                     offset = global_end - req_local_end
-                    actual_seq_lengths_key[i] = seq_lens[i].item() - offset
+                    actual_seq_lengths_key[i] = int(seq_lens_cpu[i]) - offset
                 else:
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
 
             actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
             actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
+            num_local_query_tokens = cum
 
             dsa_cp_context = DSACPContext(
                 num_tokens=num_tokens,
@@ -315,7 +322,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
 
         top_k_indices_skip_li_query = None
-        num_actual_seqs = num_reqs
+        num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))
         lightning_indexer_metadata = common_attn_metadata.lightning_indexer_metadata
         if self.enable_lightning_indexer_skip and lightning_indexer_metadata is not None:
             li_reorder_indices = lightning_indexer_metadata.li_reorder_indices.to(dtype=torch.int64)
@@ -346,6 +353,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cos=cos[:num_input_tokens],
             dsa_cp_context=dsa_cp_context,
             num_actual_seqs=num_actual_seqs,
+            num_local_query_tokens=num_local_query_tokens,
             top_k_indices_skip_li_query=top_k_indices_skip_li_query,
         )
 
@@ -1022,7 +1030,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_seqs = attn_metadata.num_actual_seqs
         num_tokens = 0
         if self.enable_lightning_indexer_skip and num_seqs > 0:
-            num_tokens = int(actual_seq_lengths_query[num_seqs - 1].item())
+            num_tokens = attn_metadata.num_local_query_tokens
             x = x[:num_tokens]
             q = q[:num_tokens] if q is not None else q
             qr = qr[:num_tokens]
@@ -1126,8 +1134,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if has_skip_suffix:
                 topk_indices = torch.cat([topk_indices, attn_metadata.top_k_indices_skip_li_query], dim=0)
 
-            actual_query_tokens = int(actual_seq_lengths_query[-1].item()) if actual_seq_lengths_query.numel() > 0 else 0
-            topk_indices = align_topk_indices_to_actual_tokens(topk_indices, actual_query_tokens)
+            topk_indices = align_topk_indices_to_actual_tokens(topk_indices, attn_metadata.num_local_query_tokens)
         else:
             topk_indices = run_lightning_indexer(
                 query=q,
