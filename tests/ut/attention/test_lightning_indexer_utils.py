@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from vllm_ascend.attention.utils import (
+    align_topk_indices_to_actual_tokens,
     get_index_of_skipped_queries_numpy,
     get_sfa_skip_indices,
     hidden_states_reorder,
@@ -40,6 +41,29 @@ def test_get_index_of_skipped_queries_numpy():
     )
     assert topk.shape == (1, 1, 6)
     assert np.array_equal(topk[0, 0], np.array([0, 1, -1, -1, -1, -1], dtype=np.int32))
+
+
+def test_align_topk_indices_to_actual_tokens_pad_and_trim():
+    topk = torch.tensor([[[0, 1, -1]]], dtype=torch.int32)
+
+    padded = align_topk_indices_to_actual_tokens(topk, 3)
+    assert padded.shape == (3, 1, 3)
+    assert torch.equal(padded[0], topk[0])
+    assert torch.equal(padded[1], torch.full((1, 3), -1, dtype=torch.int32))
+    assert torch.equal(padded[2], torch.full((1, 3), -1, dtype=torch.int32))
+
+    oversized = torch.tensor(
+        [
+            [[0, 1, -1]],
+            [[0, 1, 2]],
+            [[0, 1, 2]],
+            [[0, 1, 2]],
+        ],
+        dtype=torch.int32,
+    )
+    trimmed = align_topk_indices_to_actual_tokens(oversized, 2)
+    assert trimmed.shape == (2, 1, 3)
+    assert torch.equal(trimmed, oversized[:2])
 
 
 def test_maybe_pad_and_reorder_inputs_and_restore_hidden_states():

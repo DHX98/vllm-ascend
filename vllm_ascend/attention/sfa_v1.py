@@ -23,6 +23,7 @@ from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    align_topk_indices_to_actual_tokens,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     maybe_save_kv_layer_to_connector,
@@ -1125,14 +1126,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if has_skip_suffix:
                 topk_indices = torch.cat([topk_indices, attn_metadata.top_k_indices_skip_li_query], dim=0)
 
-            if topk_indices.shape[0] < attn_metadata.num_input_tokens:
-                indices_pad = torch.full(
-                    (attn_metadata.num_input_tokens - topk_indices.shape[0], 1, 2048),
-                    -1,
-                    dtype=torch.int32,
-                    device=weights.device,
-                )
-                topk_indices = torch.cat([topk_indices, indices_pad], dim=0)
+            topk_indices = align_topk_indices_to_actual_tokens(topk_indices, attn_metadata.num_actual_tokens)
         else:
             topk_indices = run_lightning_indexer(
                 query=q,

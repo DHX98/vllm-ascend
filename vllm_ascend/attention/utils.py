@@ -442,6 +442,22 @@ def get_index_of_skipped_queries_numpy(actual_seq_lengths_query, actual_seq_leng
     return top_k_indices_of_skipped_queries
 
 
+def align_topk_indices_to_actual_tokens(topk_indices: torch.Tensor, num_actual_tokens: int) -> torch.Tensor:
+    if topk_indices.shape[0] > num_actual_tokens:
+        return topk_indices[:num_actual_tokens]
+
+    if topk_indices.shape[0] < num_actual_tokens:
+        indices_pad = torch.full(
+            (num_actual_tokens - topk_indices.shape[0], *topk_indices.shape[1:]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        return torch.cat([topk_indices, indices_pad], dim=0)
+
+    return topk_indices
+
+
 def maybe_pad_and_reorder_inputs(input_ids, positions, reorder_indices):
     reorder_indices = reorder_indices.to(dtype=torch.int64)
     input_ids_reorder = torch.index_select(input_ids, 0, reorder_indices)
