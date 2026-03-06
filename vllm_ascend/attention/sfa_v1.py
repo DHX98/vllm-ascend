@@ -1126,7 +1126,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if has_skip_suffix:
                 topk_indices = torch.cat([topk_indices, attn_metadata.top_k_indices_skip_li_query], dim=0)
 
-            topk_indices = align_topk_indices_to_actual_tokens(topk_indices, attn_metadata.num_actual_tokens)
+            actual_query_tokens = int(actual_seq_lengths_query[-1].item()) if actual_seq_lengths_query.numel() > 0 else 0
+            topk_indices = align_topk_indices_to_actual_tokens(topk_indices, actual_query_tokens)
         else:
             topk_indices = run_lightning_indexer(
                 query=q,
