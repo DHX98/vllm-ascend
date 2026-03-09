@@ -227,20 +227,26 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
     ) -> AscendSFAMetadata:
+        raw_num_actual_reqs = getattr(common_attn_metadata, "num_actual_reqs", 0)
+        num_actual_reqs = (
+            raw_num_actual_reqs
+            if isinstance(raw_num_actual_reqs, int) and raw_num_actual_reqs > 0
+            else common_attn_metadata.num_reqs
+        )
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         num_input_tokens = common_attn_metadata.num_input_tokens
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
-        block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        block_table = common_attn_metadata.block_table_tensor[:num_actual_reqs]
         lightning_indexer_metadata = common_attn_metadata.lightning_indexer_metadata
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
-        cum_query_lens_cpu_for_dsa_cp = query_start_loc_cpu[1 : num_reqs + 1]
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_actual_reqs + 1]
+        cum_query_lens = common_attn_metadata.query_start_loc[1 : num_actual_reqs + 1]
+        cum_query_lens_cpu_for_dsa_cp = query_start_loc_cpu[1 : num_actual_reqs + 1]
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        seq_lens_cpu_for_dsa_cp = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        seq_lens = common_attn_metadata.seq_lens[:num_actual_reqs]
+        seq_lens_cpu_for_dsa_cp = common_attn_metadata.seq_lens_cpu[:num_actual_reqs]
         num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))
         num_total_seqs = num_actual_seqs
         num_local_query_tokens = num_actual_tokens

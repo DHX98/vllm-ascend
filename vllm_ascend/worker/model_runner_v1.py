@@ -1238,9 +1238,11 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             if self.enable_lightning_indexer_skip:
+                num_actual_reqs = int(np.count_nonzero(num_scheduled_tokens_np))
+                actual_num_scheduled_tokens_np = num_scheduled_tokens_np[:num_actual_reqs]
                 li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skipped_query_mask = get_sfa_skip_indices(
                     self.input_batch.num_computed_tokens_cpu,
-                    num_scheduled_tokens_np,
+                    actual_num_scheduled_tokens_np,
                     skip_threshold=self.lightning_indexer_skip_threshold,
                 )
 
@@ -1250,7 +1252,7 @@ class NPUModelRunner(GPUModelRunner):
                     top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
                         li_cum_query_lens,
                         li_seq_lens,
-                        num_reqs,
+                        num_actual_reqs,
                         2048,
                     )
                     self.lightning_indexer_metadata = AscendLightningIndexerMetadata(
@@ -1271,7 +1273,7 @@ class NPUModelRunner(GPUModelRunner):
                         top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
                         .pin_memory()
                         .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        num_actual_reqs=num_reqs,
+                        num_actual_reqs=num_actual_reqs,
                         skip_threshold=self.lightning_indexer_skip_threshold,
                     )
                 else:
@@ -1977,6 +1979,7 @@ class NPUModelRunner(GPUModelRunner):
             return {}, None
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
+        num_actual_reqs = int(np.count_nonzero(num_scheduled_tokens_np)) if num_scheduled_tokens_np is not None else num_reqs
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
@@ -2065,6 +2068,7 @@ class NPUModelRunner(GPUModelRunner):
             num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens,
+            num_actual_reqs=num_actual_reqs,
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,

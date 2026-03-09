@@ -33,4 +33,14 @@ def test_sfa_skip_topk_alignment_uses_local_query_tokens_without_device_sync():
     assert "block_table = common_attn_metadata.block_table_tensor[:num_actual_seqs]" in source
     assert "torch.cat([block_table, block_table[li_skip_request_mask]], dim=0)" in source
     assert "num_segs = num_total_seqs" in source
+    assert "raw_num_actual_reqs = getattr(common_attn_metadata, \"num_actual_reqs\", 0)" in source
+    assert "block_table = common_attn_metadata.block_table_tensor[:num_actual_reqs]" in source
     assert source.index("input_positions = input_positions_pad") < source.index("cos, sin = get_cos_and_sin_mla(input_positions, True)")
+
+
+def test_model_runner_tracks_actual_request_count_separately_from_padding():
+    source = Path("vllm_ascend/worker/model_runner_v1.py").read_text()
+
+    assert "num_actual_reqs = int(np.count_nonzero(num_scheduled_tokens_np))" in source
+    assert "actual_num_scheduled_tokens_np = num_scheduled_tokens_np[:num_actual_reqs]" in source
+    assert "num_actual_reqs=num_actual_reqs" in source

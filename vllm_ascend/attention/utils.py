@@ -169,6 +169,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Total number of tokens including padding, used for padding operations.
     num_input_tokens: int = 0
 
+    # Number of real requests before any graph-padding-only dummy requests.
+    num_actual_reqs: int = 0
+
     # Metadata for Prefill Context Parallelism (PCP) operations.
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
 
@@ -185,6 +188,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs],
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
+            num_actual_reqs=num_actual_reqs,
             max_query_len=self.max_query_len,
             decode_token_per_req=self.decode_token_per_req,
             # NOTE: keep all tokens for block_table_tensor and slot_mapping otherwise

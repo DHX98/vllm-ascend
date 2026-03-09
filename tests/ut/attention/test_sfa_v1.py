@@ -202,6 +202,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
             [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+        common_attn_metadata.num_actual_reqs = 9
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
@@ -267,6 +268,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             [0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int32)
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
             [0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int32)
+        common_attn_metadata.num_actual_reqs = 1
         common_attn_metadata.slot_mapping = torch.arange(8, dtype=torch.int32)
         common_attn_metadata.seq_lens = torch.tensor([1] * 8, dtype=torch.int32)
         common_attn_metadata.seq_lens_cpu = torch.tensor([1] * 8, dtype=torch.int32)
@@ -336,6 +338,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             [0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int32)
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
             [0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int32)
+        common_attn_metadata.num_actual_reqs = 1
         common_attn_metadata.slot_mapping = torch.arange(8, dtype=torch.int32)
         common_attn_metadata.seq_lens = torch.tensor([1] * 8, dtype=torch.int32)
         common_attn_metadata.seq_lens_cpu = torch.tensor([1] * 8, dtype=torch.int32)
@@ -411,6 +414,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
             [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+        common_attn_metadata.num_actual_reqs = 9
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
