@@ -450,13 +450,13 @@ def get_index_of_skipped_queries_numpy(actual_seq_lengths_query, actual_seq_leng
     return top_k_indices_of_skipped_queries
 
 
-def align_topk_indices_to_actual_tokens(topk_indices: torch.Tensor, num_actual_tokens: int) -> torch.Tensor:
-    if topk_indices.shape[0] > num_actual_tokens:
-        return topk_indices[:num_actual_tokens]
+def align_topk_indices_to_query_slots(topk_indices: torch.Tensor, num_query_slots: int) -> torch.Tensor:
+    if topk_indices.shape[0] > num_query_slots:
+        return topk_indices[:num_query_slots]
 
-    if topk_indices.shape[0] < num_actual_tokens:
+    if topk_indices.shape[0] < num_query_slots:
         indices_pad = torch.full(
-            (num_actual_tokens - topk_indices.shape[0], *topk_indices.shape[1:]),
+            (num_query_slots - topk_indices.shape[0], *topk_indices.shape[1:]),
             -1,
             dtype=topk_indices.dtype,
             device=topk_indices.device,
@@ -464,6 +464,10 @@ def align_topk_indices_to_actual_tokens(topk_indices: torch.Tensor, num_actual_t
         return torch.cat([topk_indices, indices_pad], dim=0)
 
     return topk_indices
+
+
+def align_topk_indices_to_actual_tokens(topk_indices: torch.Tensor, num_actual_tokens: int) -> torch.Tensor:
+    return align_topk_indices_to_query_slots(topk_indices, num_actual_tokens)
 
 
 def maybe_pad_and_reorder_inputs(input_ids, positions, reorder_indices):

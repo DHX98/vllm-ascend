@@ -23,7 +23,7 @@ from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
-    align_topk_indices_to_actual_tokens,
+    align_topk_indices_to_query_slots,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     maybe_save_kv_layer_to_connector,
@@ -145,6 +145,8 @@ class AscendSFAMetadata:
     num_prefills: int = 0
     num_actual_seqs: int = 0
     num_local_query_tokens: int = 0
+    # Number of local query slots presented to SFA, including graph padding.
+    num_local_query_slots: int = 0
     # Option2 splits the reordered batch into an indexer prefix and a skip suffix.
     # Track the prefix token count separately from the total local token count.
     num_local_indexer_tokens: int = 0
@@ -250,6 +252,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))
         num_total_seqs = num_actual_seqs
         num_local_query_tokens = num_actual_tokens
+        num_local_query_slots = num_input_tokens
         num_local_indexer_tokens = num_actual_tokens
         top_k_indices_skip_li_query = None
         if self.enable_lightning_indexer_skip and lightning_indexer_metadata is not None:
@@ -287,6 +290,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             local_start = get_tp_group().rank_in_group * num_tokens_per_device
             local_end_with_pad = local_start + num_tokens_per_device
             local_end = min(local_end_with_pad, num_actual_tokens)
+            num_local_query_slots = num_tokens_per_device
 
             pad_size = num_tokens_pad - cos.shape[0]
             assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
@@ -377,6 +381,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             num_actual_seqs=num_actual_seqs,
             num_local_query_tokens=num_local_query_tokens,
+            num_local_query_slots=num_local_query_slots,
             num_local_indexer_tokens=num_local_indexer_tokens,
             top_k_indices_skip_li_query=top_k_indices_skip_li_query,
         )
@@ -1137,10 +1142,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.enable_lightning_indexer_skip and not AscendSFAImpl._logged_li_skip_runtime_path:
             logger.info(
                 "[DSA-CP option2] lightning_indexer_skip runtime path hit: "
-                "prefix_num_seqs=%d, prefix_num_tokens=%d, total_num_tokens=%d, has_skip_suffix=%s",
+                "prefix_num_seqs=%d, prefix_num_tokens=%d, total_num_tokens=%d, query_slots=%d, has_skip_suffix=%s",
                 num_seqs,
                 num_tokens,
                 attn_metadata.num_local_query_tokens,
+                attn_metadata.num_local_query_slots,
                 has_skip_suffix,
             )
             AscendSFAImpl._logged_li_skip_runtime_path = True
@@ -1161,7 +1167,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if has_skip_suffix:
                 topk_indices = torch.cat([topk_indices, attn_metadata.top_k_indices_skip_li_query], dim=0)
 
-            topk_indices = align_topk_indices_to_actual_tokens(topk_indices, attn_metadata.num_local_query_tokens)
+            topk_indices = align_topk_indices_to_query_slots(topk_indices, attn_metadata.num_local_query_slots)
         else:
             topk_indices = run_lightning_indexer(
                 query=q,
