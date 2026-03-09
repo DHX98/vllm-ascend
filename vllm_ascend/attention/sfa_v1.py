@@ -60,6 +60,25 @@ if TYPE_CHECKING:
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
 
+def _preview_tensor(tensor: torch.Tensor | None, limit: int = 16) -> list[int | float]:
+    if tensor is None or not torch.is_tensor(tensor):
+        return []
+    flat = tensor.detach().cpu().reshape(-1)
+    return flat[: min(limit, flat.numel())].tolist()
+
+
+def _tensor_stats(tensor: torch.Tensor | None) -> str:
+    if tensor is None or not torch.is_tensor(tensor):
+        return "none"
+    if tensor.numel() == 0:
+        return f"shape={tuple(tensor.shape)} empty"
+    data = tensor.detach().float().cpu()
+    return (
+        f"shape={tuple(tensor.shape)} mean={data.mean().item():.6f} "
+        f"absmax={data.abs().max().item():.6f}"
+    )
+
+
 class AscendSFABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -413,6 +432,8 @@ class AscendSFAImpl(MLAAttentionImpl):
     o_proj_full_pool: torch.Tensor | None = None
     _logged_li_skip_runtime_path = False
     _logged_o_proj_switch_runtime_path = False
+    _logged_option2_attention_debug = 0
+    _logged_option2_o_proj_debug = False
 
     def __init__(
         self,
@@ -947,9 +968,56 @@ class AscendSFAImpl(MLAAttentionImpl):
             need_gather_q_kv=need_gather_q_kv,
         )
 
+        if (
+            self.enable_lightning_indexer_skip
+            and not forward_context.in_profile_run
+            and layer_name.endswith("layers.0.self_attn")
+            and AscendSFAImpl._logged_option2_attention_debug < 2
+        ):
+            slot_mapping_debug = attn_metadata.slot_mapping
+            if self.enable_dsa_cp and attn_metadata.dsa_cp_context is not None:
+                slot_mapping_debug = attn_metadata.dsa_cp_context.slot_mapping_cp
+            logger.info(
+                "[DSA-CP option2][attn-debug][pre-sfa] layer=%s state=%s "
+                "num_input_tokens=%d num_actual_tokens=%d num_actual_seqs=%d "
+                "local_indexer_tokens=%d local_query_tokens=%d local_query_slots=%d "
+                "ql_nope=%s q_pe=%s topk_shape=%s topk_row0=%s "
+                "cum_query_lens=%s seq_lens=%s actual_seq_q=%s actual_seq_k=%s slot_mapping=%s",
+                layer_name,
+                attn_metadata.attn_state.name,
+                attn_metadata.num_input_tokens,
+                attn_metadata.num_actual_tokens,
+                attn_metadata.num_actual_seqs,
+                attn_metadata.num_local_indexer_tokens,
+                attn_metadata.num_local_query_tokens,
+                attn_metadata.num_local_query_slots,
+                _tensor_stats(ql_nope),
+                _tensor_stats(q_pe),
+                tuple(topk_indices.shape),
+                _preview_tensor(topk_indices[0, 0] if topk_indices.numel() > 0 else None),
+                _preview_tensor(attn_metadata.cum_query_lens),
+                _preview_tensor(attn_metadata.seq_lens),
+                _preview_tensor(actual_seq_lengths_query),
+                _preview_tensor(actual_seq_lengths_key),
+                _preview_tensor(slot_mapping_debug),
+            )
+
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )
+
+        if (
+            self.enable_lightning_indexer_skip
+            and not forward_context.in_profile_run
+            and layer_name.endswith("layers.0.self_attn")
+            and AscendSFAImpl._logged_option2_attention_debug < 2
+        ):
+            logger.info(
+                "[DSA-CP option2][attn-debug][post-sfa] layer=%s attn_output=%s",
+                layer_name,
+                _tensor_stats(attn_output),
+            )
+            AscendSFAImpl._logged_option2_attention_debug += 1
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
@@ -1237,6 +1305,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 should_shard_weight,
             )
             AscendSFAImpl._logged_o_proj_switch_runtime_path = True
+        if self.enable_lightning_indexer_skip and not AscendSFAImpl._logged_option2_o_proj_debug:
+            logger.info(
+                "[DSA-CP option2][o-proj-debug] should_shard_weight=%s attn_output=%s",
+                should_shard_weight,
+                _tensor_stats(attn_output),
+            )
+            AscendSFAImpl._logged_option2_o_proj_debug = True
         if should_shard_weight:
             # Wait for the completion of o_proj weight all-gather operation
             if o_proj_full_handle is not None:

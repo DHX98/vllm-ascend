@@ -163,6 +163,29 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+def _preview_values(value: torch.Tensor | np.ndarray | None, limit: int = 16) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.reshape(-1)[:limit].tolist()
+    if torch.is_tensor(value):
+        flat = value.detach().cpu().reshape(-1)
+        return flat[: min(limit, flat.numel())].tolist()
+    return []
+
+
+def _tensor_stats(value: torch.Tensor | None) -> str:
+    if value is None or not torch.is_tensor(value):
+        return "none"
+    if value.numel() == 0:
+        return f"shape={tuple(value.shape)} empty"
+    data = value.detach().float().cpu()
+    return (
+        f"shape={tuple(value.shape)} mean={data.mean().item():.6f} "
+        f"absmax={data.abs().max().item():.6f}"
+    )
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -399,6 +422,8 @@ class NPUModelRunner(GPUModelRunner):
         self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
         self.lightning_indexer_skip_threshold = get_lightning_indexer_skip_threshold()
         self.lightning_indexer_metadata: AscendLightningIndexerMetadata | None = None
+        self._logged_option2_batch_debug = False
+        self._logged_option2_logits_debug = False
 
     @property
     def use_cp(self) -> bool:
@@ -1376,17 +1401,48 @@ class NPUModelRunner(GPUModelRunner):
             ),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            input_ids_before_reorder = input_ids
+            positions_before_reorder = positions
             if self.enable_lightning_indexer_skip and self.lightning_indexer_metadata is not None:
                 input_ids, positions = maybe_pad_and_reorder_inputs(
                     input_ids, positions, self.lightning_indexer_metadata.li_reorder_indices
                 )
+                if not self._logged_option2_batch_debug and get_tp_group().rank_in_group == 0:
+                    metadata = self.lightning_indexer_metadata
+                    logger.info(
+                        "[DSA-CP option2][batch-debug] "
+                        "num_reqs=%d num_tokens_padded=%d actual_tokens=%d reorder_len=%d "
+                        "input_ids_before=%s input_ids_after=%s positions_before=%s positions_after=%s "
+                        "li_reorder=%s li_restore=%s li_cum_query_lens=%s li_seq_lens=%s li_skip_mask=%s",
+                        num_reqs,
+                        num_tokens_padded,
+                        scheduler_output.total_num_scheduled_tokens,
+                        int(metadata.li_reorder_indices.numel()),
+                        _preview_values(input_ids_before_reorder),
+                        _preview_values(input_ids),
+                        _preview_values(positions_before_reorder),
+                        _preview_values(positions),
+                        _preview_values(metadata.li_reorder_indices),
+                        _preview_values(metadata.li_restore_indices),
+                        _preview_values(metadata.li_cum_query_lens_cpu),
+                        _preview_values(metadata.li_seq_lens_cpu),
+                        _preview_values(metadata.li_skip_request_mask),
+                    )
 
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
 
             if self.enable_lightning_indexer_skip and self.lightning_indexer_metadata is not None:
+                hidden_states_before_restore = hidden_states
                 hidden_states = hidden_states_reorder(hidden_states, self.lightning_indexer_metadata.li_restore_indices)
+                if not self._logged_option2_batch_debug and get_tp_group().rank_in_group == 0:
+                    logger.info(
+                        "[DSA-CP option2][restore-debug] hidden_states_before=%s hidden_states_after=%s",
+                        _tensor_stats(hidden_states_before_restore if torch.is_tensor(hidden_states_before_restore) else None),
+                        _tensor_stats(hidden_states if torch.is_tensor(hidden_states) else None),
+                    )
+                    self._logged_option2_batch_debug = True
 
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -1446,6 +1502,23 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            if (
+                self.enable_lightning_indexer_skip
+                and not self._logged_option2_logits_debug
+                and logits is not None
+                and get_tp_group().rank_in_group == 0
+            ):
+                topk = min(8, logits.shape[-1])
+                topk_vals, topk_ids = torch.topk(logits[0], k=topk)
+                logger.info(
+                    "[DSA-CP option2][logits-debug] logits=%s sample_hidden_states=%s topk_ids=%s topk_vals=%s",
+                    _tensor_stats(logits),
+                    _tensor_stats(sample_hidden_states),
+                    _preview_values(topk_ids),
+                    _preview_values(topk_vals),
+                )
+                self._logged_option2_logits_debug = True
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
