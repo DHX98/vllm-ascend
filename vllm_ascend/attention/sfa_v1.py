@@ -145,6 +145,9 @@ class AscendSFAMetadata:
     num_prefills: int = 0
     num_actual_seqs: int = 0
     num_local_query_tokens: int = 0
+    # Option2 splits the reordered batch into an indexer prefix and a skip suffix.
+    # Track the prefix token count separately from the total local token count.
+    num_local_indexer_tokens: int = 0
     top_k_indices_skip_li_query: torch.Tensor | None = None
 
 
@@ -194,7 +197,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.enable_dsa_cp = enable_dsa_cp()
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
-        self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
+        max_num_option2_reqs = max_num_reqs * 2
+        self.actual_seq_lengths_query = torch.zeros(max_num_option2_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
 
         self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
@@ -238,6 +242,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         seq_lens_cpu_for_dsa_cp = common_attn_metadata.seq_lens_cpu[:num_reqs]
         num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))
+        num_total_seqs = num_actual_seqs
+        num_local_query_tokens = num_actual_tokens
+        num_local_indexer_tokens = num_actual_tokens
         top_k_indices_skip_li_query = None
         if self.enable_lightning_indexer_skip and lightning_indexer_metadata is not None:
             num_actual_seqs = lightning_indexer_metadata.num_actual_reqs
@@ -251,17 +258,21 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             slot_mapping = slot_mapping_pad
             cum_query_lens = lightning_indexer_metadata.li_cum_query_lens
             seq_lens = lightning_indexer_metadata.li_seq_lens
-            cum_query_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_cum_query_lens_cpu[:num_actual_seqs]
-            seq_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_seq_lens_cpu[:num_actual_seqs]
+            cum_query_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_cum_query_lens_cpu
+            seq_lens_cpu_for_dsa_cp = lightning_indexer_metadata.li_seq_lens_cpu
+            num_total_seqs = int(seq_lens_cpu_for_dsa_cp.shape[0])
             block_table = common_attn_metadata.block_table_tensor[:num_actual_seqs]
             li_skip_request_mask = lightning_indexer_metadata.li_skip_request_mask
             block_table = torch.cat([block_table, block_table[li_skip_request_mask]], dim=0)
             top_k_indices_skip_li_query = lightning_indexer_metadata.top_k_indices_of_skipped_queries
+            if num_actual_seqs > 0:
+                num_local_indexer_tokens = int(cum_query_lens_cpu_for_dsa_cp[num_actual_seqs - 1])
+            else:
+                num_local_indexer_tokens = 0
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
         dsa_cp_context = None
-        num_local_query_tokens = num_actual_tokens
         if self.enable_dsa_cp:
             global_tp_size = get_tp_group().world_size
             num_tokens = num_input_tokens
@@ -304,9 +315,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_seq_lengths_query = self.actual_seq_lengths_query
             actual_seq_lengths_key = self.actual_seq_lengths_key
 
-            num_segs = num_actual_seqs
+            num_segs = num_total_seqs
+            prefix_num_segs = min(num_actual_seqs, num_segs)
             last_token = 0
             cum = 0
+            num_local_indexer_tokens = 0
             for i in range(0, num_segs):
                 global_start = last_token
                 global_end = int(cum_query_lens_cpu_for_dsa_cp[i])
@@ -314,7 +327,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
                 req_local_start = max(global_start, local_start)
                 req_local_end = min(global_end, local_end_with_pad)
-                num_local_tokens = req_local_end - req_local_start
+                num_local_tokens = max(req_local_end - req_local_start, 0)
 
                 if num_local_tokens > 0:
                     cum += num_local_tokens
@@ -326,8 +339,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
 
-            actual_seq_lengths_query = actual_seq_lengths_query[:num_actual_seqs]
-            actual_seq_lengths_key = actual_seq_lengths_key[:num_actual_seqs]
+                if i + 1 == prefix_num_segs:
+                    num_local_indexer_tokens = cum
+
+            actual_seq_lengths_query = actual_seq_lengths_query[:num_segs]
+            actual_seq_lengths_key = actual_seq_lengths_key[:num_segs]
             num_local_query_tokens = cum
 
             dsa_cp_context = DSACPContext(
@@ -355,6 +371,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             num_actual_seqs=num_actual_seqs,
             num_local_query_tokens=num_local_query_tokens,
+            num_local_indexer_tokens=num_local_indexer_tokens,
             top_k_indices_skip_li_query=top_k_indices_skip_li_query,
         )
 
@@ -1031,10 +1048,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_seqs = attn_metadata.num_actual_seqs
         num_tokens = 0
         if self.enable_lightning_indexer_skip and num_seqs > 0:
-            num_tokens = attn_metadata.num_local_query_tokens
+            num_tokens = attn_metadata.num_local_indexer_tokens
             x = x[:num_tokens]
             q = q[:num_tokens] if q is not None else q
             qr = qr[:num_tokens]
+            cos = cos[:num_tokens]
+            sin = sin[:num_tokens]
 
         if q is None:
             q, _ = self.wq_b(qr)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
@@ -1112,9 +1131,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.enable_lightning_indexer_skip and not AscendSFAImpl._logged_li_skip_runtime_path:
             logger.info(
                 "[DSA-CP option2] lightning_indexer_skip runtime path hit: "
-                "num_seqs=%d, num_tokens=%d, has_skip_suffix=%s",
+                "prefix_num_seqs=%d, prefix_num_tokens=%d, total_num_tokens=%d, has_skip_suffix=%s",
                 num_seqs,
                 num_tokens,
+                attn_metadata.num_local_query_tokens,
                 has_skip_suffix,
             )
             AscendSFAImpl._logged_li_skip_runtime_path = True

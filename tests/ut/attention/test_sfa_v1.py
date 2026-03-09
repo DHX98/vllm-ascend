@@ -367,7 +367,11 @@ class TestAscendSFAMetadataBuilder(TestBase):
         )
 
         assert metadata.num_actual_seqs == 1
+        assert metadata.num_local_indexer_tokens == 0
+        assert metadata.num_local_query_tokens == 1
         assert metadata.block_table.shape == (2, 2)
+        assert torch.equal(metadata.cum_query_lens, torch.tensor([0, 1], dtype=torch.int32))
+        assert torch.equal(metadata.seq_lens, torch.tensor([1, 1], dtype=torch.int32))
         assert torch.equal(metadata.block_table[0], common_attn_metadata.block_table_tensor[0])
         assert torch.equal(metadata.block_table[1], common_attn_metadata.block_table_tensor[0])
 
