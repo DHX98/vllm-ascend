@@ -27,6 +27,9 @@ def test_sfa_skip_topk_alignment_uses_local_query_slots_without_device_sync():
     assert "num_local_query_slots = num_input_tokens" in source
     assert "num_local_query_slots = num_tokens_per_device" in source
     assert "align_topk_indices_to_query_slots(topk_indices, attn_metadata.num_local_query_slots)" in source
+    assert "local_topk_indices = get_index_of_skipped_queries_numpy(" in source
+    assert "actual_seq_lengths_query_cpu = np.zeros(num_segs, dtype=np.int32)" in source
+    assert "actual_seq_lengths_key_cpu = np.zeros(num_segs, dtype=np.int32)" in source
     assert "actual_seq_lengths_query[num_seqs - 1].item()" not in source
     assert "actual_seq_lengths_query[-1].item()" not in source
     assert "query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]" in source

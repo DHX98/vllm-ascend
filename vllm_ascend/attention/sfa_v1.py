@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
+import numpy as np
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
@@ -26,6 +27,7 @@ from vllm_ascend.attention.utils import (
     align_topk_indices_to_query_slots,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    get_index_of_skipped_queries_numpy,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -345,6 +347,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_seq_lengths_key = self.actual_seq_lengths_key
 
             num_segs = num_total_seqs
+            actual_seq_lengths_query_cpu = np.zeros(num_segs, dtype=np.int32)
+            actual_seq_lengths_key_cpu = np.zeros(num_segs, dtype=np.int32)
             prefix_num_segs = min(num_actual_seqs, num_segs)
             last_token = 0
             cum = 0
@@ -361,12 +365,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 if num_local_tokens > 0:
                     cum += num_local_tokens
                     actual_seq_lengths_query[i] = cum
+                    actual_seq_lengths_query_cpu[i] = cum
 
                     offset = global_end - req_local_end
                     actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
+                    actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
                 else:
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
+                    actual_seq_lengths_query_cpu[i] = cum
+                    actual_seq_lengths_key_cpu[i] = 0
 
                 if i + 1 == prefix_num_segs:
                     num_local_indexer_tokens = cum
@@ -374,6 +382,20 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_seq_lengths_query = actual_seq_lengths_query[:num_segs]
             actual_seq_lengths_key = actual_seq_lengths_key[:num_segs]
             num_local_query_tokens = cum
+            if self.enable_lightning_indexer_skip and top_k_indices_skip_li_query is not None:
+                # Option2 skip suffix still follows DSA-CP local token partitioning,
+                # so regenerate sparse indices from local query/key lengths instead of
+                # reusing the global-request layout prepared in model_runner.
+                local_topk_indices = get_index_of_skipped_queries_numpy(
+                    actual_seq_lengths_query_cpu,
+                    actual_seq_lengths_key_cpu,
+                    num_actual_seqs,
+                    2048,
+                )
+                top_k_indices_skip_li_query = torch.from_numpy(local_topk_indices).to(
+                    dtype=torch.int32,
+                    device=self.device,
+                )
 
             dsa_cp_context = DSACPContext(
                 num_tokens=num_tokens,
