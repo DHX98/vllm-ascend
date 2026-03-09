@@ -488,8 +488,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     "[DSA-CP option2] dual chunk swap metadata path enabled: tp_size=%d "
                     "sample_query_lens=%s sample_padded_lens=%s",
                     global_tp_size,
-                    query_lens_cpu_for_dsa_cp[:8].tolist(),
-                    padded_query_lens[:8].tolist(),
+                    tuple(query_lens_cpu_for_dsa_cp[:8].tolist()),
+                    tuple(padded_query_lens[:8].tolist()),
                 )
             else:
                 num_tokens = num_input_tokens

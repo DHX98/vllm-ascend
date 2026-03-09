@@ -27,6 +27,8 @@ def test_sfa_skip_topk_alignment_uses_local_query_slots_without_device_sync():
     assert "build_dual_chunk_swap_plan(" in source
     assert "segment_req_indices" in source
     assert "metadata_num_input_tokens = num_local_query_slots" in source
+    assert "tuple(query_lens_cpu_for_dsa_cp[:8].tolist())" in source
+    assert "tuple(padded_query_lens[:8].tolist())" in source
     assert "num_tokens = attn_metadata.num_local_indexer_tokens" in source
     assert "num_local_indexer_tokens=num_local_indexer_tokens" in source
     assert "num_local_query_slots=num_local_query_slots" in source
