@@ -15,7 +15,8 @@ if 'torch_npu._inductor' not in sys.modules:
 
 from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
                                           AscendSFAMetadata,
-                                          AscendSFAMetadataBuilder)
+                                          AscendSFAMetadataBuilder,
+                                          build_dsa_cp_dual_chunk_swap_segments)
 from vllm_ascend.utils import enable_dsa_cp
 
 
@@ -160,6 +161,22 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         assert builder.device == device
         assert builder.vllm_config == vllm_config
+
+    def test_build_dsa_cp_dual_chunk_swap_segments_prefill(self):
+        query_lens = torch.tensor([28], dtype=torch.int32).numpy()
+        seq_lens = torch.tensor([28], dtype=torch.int32).numpy()
+
+        seg_q, seg_k, seg_req_indices, padded_lens = build_dsa_cp_dual_chunk_swap_segments(
+            query_lens=query_lens,
+            seq_lens=seq_lens,
+            group_size=8,
+            rank=3,
+        )
+
+        self.assertTrue((seg_q == torch.tensor([2, 4], dtype=torch.int32).numpy()).all())
+        self.assertTrue((seg_k == torch.tensor([8, 26], dtype=torch.int32).numpy()).all())
+        self.assertTrue((seg_req_indices == torch.tensor([0, 0], dtype=torch.int32).numpy()).all())
+        self.assertTrue((padded_lens == torch.tensor([32], dtype=torch.int32).numpy()).all())
 
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")

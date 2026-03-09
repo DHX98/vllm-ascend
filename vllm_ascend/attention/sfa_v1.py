@@ -54,12 +54,14 @@ from vllm_ascend.utils import (
     maybe_trans_nz,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.pcp_utils import build_dual_chunk_swap_plan
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+DUAL_CHUNK_SWAP_DECODE_THRESHOLD = 1
 
 
 def _preview_tensor(tensor: torch.Tensor | None, limit: int = 16) -> list[int | float]:
@@ -79,6 +81,119 @@ def _tensor_stats(tensor: torch.Tensor | None) -> str:
         f"shape={tuple(tensor.shape)} mean={data.mean().item():.6f} "
         f"absmax={data.abs().max().item():.6f}"
     )
+
+
+def _to_numpy_int32(values: torch.Tensor | np.ndarray | list[int]) -> np.ndarray:
+    if torch.is_tensor(values):
+        return values.detach().cpu().numpy().astype(np.int32, copy=False)
+    return np.asarray(values, dtype=np.int32)
+
+
+def build_dsa_cp_dual_chunk_swap_segments(
+    query_lens: np.ndarray,
+    seq_lens: np.ndarray,
+    group_size: int,
+    rank: int,
+    decode_threshold: int = DUAL_CHUNK_SWAP_DECODE_THRESHOLD,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build per-rank option2 segment metadata for DSA-CP.
+
+    Dual Chunk Swap splits each prefill request into head/tail segments and keeps
+    request-shaped tensors aligned with the local TP rank view. Decode-style
+    requests keep a single logical segment to avoid perturbing the steady-state
+    decode semantics.
+    """
+
+    query_lens = np.asarray(query_lens, dtype=np.int32)
+    seq_lens = np.asarray(seq_lens, dtype=np.int32)
+    if query_lens.shape != seq_lens.shape:
+        raise ValueError(
+            f"query_lens and seq_lens must have the same shape, got {query_lens.shape} and {seq_lens.shape}"
+        )
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+    if rank < 0 or rank >= group_size:
+        raise ValueError(f"rank must be in [0, {group_size}), got {rank}")
+
+    if query_lens.size == 0:
+        empty = np.array([], dtype=np.int32)
+        return empty, empty, empty, empty
+
+    padded_lens = np.ceil(query_lens / (2 * group_size)).astype(np.int32) * (2 * group_size)
+    decode_mask = query_lens <= decode_threshold
+    if np.any(decode_mask):
+        padded_lens[decode_mask] = query_lens[decode_mask] * group_size
+
+    segment_query_lens: list[int] = []
+    segment_key_lens: list[int] = []
+    segment_req_indices: list[int] = []
+
+    for req_idx, (query_len, seq_len, padded_len) in enumerate(zip(query_lens, seq_lens, padded_lens, strict=False)):
+        query_len_i = int(query_len)
+        seq_len_i = int(seq_len)
+        padded_len_i = int(padded_len)
+
+        if query_len_i <= decode_threshold:
+            local_query_len = query_len_i if rank == 0 else 0
+            segment_query_lens.append(local_query_len)
+            segment_key_lens.append(seq_len_i)
+            segment_req_indices.append(req_idx)
+            continue
+
+        chunk_len = padded_len_i // (2 * group_size)
+        base_key_len = seq_len_i - query_len_i
+
+        head_start = rank * chunk_len
+        head_end = min(query_len_i, head_start + chunk_len)
+        head_query_len = max(head_end - head_start, 0)
+
+        tail_start = (2 * group_size - rank - 1) * chunk_len
+        tail_end = min(query_len_i, tail_start + chunk_len)
+        tail_query_len = max(tail_end - tail_start, 0)
+
+        segment_query_lens.extend([head_query_len, tail_query_len])
+        segment_key_lens.extend([base_key_len + head_end, base_key_len + tail_end])
+        segment_req_indices.extend([req_idx, req_idx])
+
+    segment_query_lens_np = np.asarray(segment_query_lens, dtype=np.int32)
+    segment_cum_query_lens = np.cumsum(segment_query_lens_np, dtype=np.int32)
+    segment_key_lens_np = np.asarray(segment_key_lens, dtype=np.int32)
+    segment_req_indices_np = np.asarray(segment_req_indices, dtype=np.int32)
+
+    return segment_cum_query_lens, segment_key_lens_np, segment_req_indices_np, padded_lens
+
+
+def build_dsa_cp_dual_chunk_swap_inputs(
+    input_positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    query_lens: np.ndarray,
+    padded_lens: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    total_padded_tokens = int(np.sum(padded_lens))
+    input_positions_pad = torch.zeros(
+        total_padded_tokens,
+        dtype=input_positions.dtype,
+        device=input_positions.device,
+    )
+    slot_mapping_pad = torch.full(
+        (total_padded_tokens,),
+        -1,
+        dtype=slot_mapping.dtype,
+        device=slot_mapping.device,
+    )
+
+    src_offset = 0
+    dst_offset = 0
+    for query_len, padded_len in zip(query_lens, padded_lens, strict=False):
+        query_len_i = int(query_len)
+        padded_len_i = int(padded_len)
+        if query_len_i > 0:
+            input_positions_pad[dst_offset : dst_offset + query_len_i] = input_positions[src_offset : src_offset + query_len_i]
+            slot_mapping_pad[dst_offset : dst_offset + query_len_i] = slot_mapping[src_offset : src_offset + query_len_i]
+        src_offset += query_len_i
+        dst_offset += padded_len_i
+
+    return input_positions_pad, slot_mapping_pad
 
 
 class AscendSFABackend(AttentionBackend):
@@ -272,6 +387,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         seq_lens_cpu_for_dsa_cp = common_attn_metadata.seq_lens_cpu[:num_actual_reqs]
         num_actual_seqs = int(torch.count_nonzero(query_lens_cpu))
         num_total_seqs = num_actual_seqs
+        metadata_num_input_tokens = common_attn_metadata.num_input_tokens
         num_local_query_tokens = num_actual_tokens
         num_local_query_slots = num_input_tokens
         num_local_indexer_tokens = num_actual_tokens
@@ -305,113 +421,193 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         dsa_cp_context = None
         if self.enable_dsa_cp:
             global_tp_size = get_tp_group().world_size
-            num_tokens = num_input_tokens
-            num_tokens_pad = _round_up(num_tokens, global_tp_size)
-            num_tokens_per_device = num_tokens_pad // global_tp_size
-            local_start = get_tp_group().rank_in_group * num_tokens_per_device
-            local_end_with_pad = local_start + num_tokens_per_device
-            local_end = min(local_end_with_pad, num_actual_tokens)
-            num_local_query_slots = num_tokens_per_device
-
-            pad_size = num_tokens_pad - cos.shape[0]
-            assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
-
-            if pad_size > 0:
-                cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
-                sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
-
-            pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
-            if pad_size_slot > 0:
-                slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
-            else:
-                slot_mapping = slot_mapping[:num_tokens_pad]
-            slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
-
-            cos = cos[local_start:local_end_with_pad]
-            sin = sin[local_start:local_end_with_pad]
-
-            assert cos.shape[0] == num_tokens_per_device, (
-                f"cos.shape[0] must be equal to num_tokens_per_device, \
-                    got {cos.shape[0]} and {num_tokens_per_device}"
-            )
-            assert slot_mapping_cp.shape[0] == num_tokens_per_device, (
-                f"slot_mapping_cp.shape[0] must be equal to num_tokens_per_device, \
-                    got {slot_mapping_cp.shape[0]} and {num_tokens_per_device}"
-            )
-            assert slot_mapping.shape[0] == num_tokens_pad, (
-                f"slot_mapping.shape[0] must be equal to num_tokens_pad, \
-                    got {slot_mapping.shape[0]} and {num_tokens_pad}"
-            )
-
             actual_seq_lengths_query = self.actual_seq_lengths_query
             actual_seq_lengths_key = self.actual_seq_lengths_key
+            tp_rank = get_tp_group().rank_in_group
+            use_dual_chunk_swap = lightning_indexer_metadata is None
 
-            num_segs = num_total_seqs
-            actual_seq_lengths_query_cpu = np.zeros(num_segs, dtype=np.int32)
-            actual_seq_lengths_key_cpu = np.zeros(num_segs, dtype=np.int32)
-            prefix_num_segs = min(num_actual_seqs, num_segs)
-            last_token = 0
-            cum = 0
-            num_local_indexer_tokens = 0
-            for i in range(0, num_segs):
-                global_start = last_token
-                global_end = int(cum_query_lens_cpu_for_dsa_cp[i])
-                last_token = global_end
-
-                req_local_start = max(global_start, local_start)
-                req_local_end = min(global_end, local_end_with_pad)
-                num_local_tokens = max(req_local_end - req_local_start, 0)
-
-                if num_local_tokens > 0:
-                    cum += num_local_tokens
-                    actual_seq_lengths_query[i] = cum
-                    actual_seq_lengths_query_cpu[i] = cum
-
-                    offset = global_end - req_local_end
-                    actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
-                    actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
-                else:
-                    actual_seq_lengths_query[i] = cum
-                    # Keep the request-level KV length even when this rank has no
-                    # local queries for the segment; skip-topk only looks at the
-                    # query deltas, but SFA still consumes the per-segment KV view.
-                    actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i])
-                    actual_seq_lengths_query_cpu[i] = cum
-                    actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i])
-
-                if i + 1 == prefix_num_segs:
-                    num_local_indexer_tokens = cum
-
-            actual_seq_lengths_query = actual_seq_lengths_query[:num_segs]
-            actual_seq_lengths_key = actual_seq_lengths_key[:num_segs]
-            num_local_query_tokens = cum
-            if self.enable_lightning_indexer_skip and top_k_indices_skip_li_query is not None:
-                # Option2 skip suffix still follows DSA-CP local token partitioning,
-                # so regenerate sparse indices from local query/key lengths instead of
-                # reusing the global-request layout prepared in model_runner.
-                local_topk_indices = get_index_of_skipped_queries_numpy(
+            if use_dual_chunk_swap:
+                query_lens_cpu_for_dsa_cp = np.diff(
+                    np.concatenate(([0], _to_numpy_int32(cum_query_lens_cpu_for_dsa_cp)))
+                ).astype(np.int32, copy=False)
+                seq_lens_cpu_np = _to_numpy_int32(seq_lens_cpu_for_dsa_cp)
+                (
                     actual_seq_lengths_query_cpu,
                     actual_seq_lengths_key_cpu,
-                    num_actual_seqs,
-                    2048,
+                    segment_req_indices,
+                    padded_query_lens,
+                ) = build_dsa_cp_dual_chunk_swap_segments(
+                    query_lens=query_lens_cpu_for_dsa_cp,
+                    seq_lens=seq_lens_cpu_np,
+                    group_size=global_tp_size,
+                    rank=tp_rank,
+                    decode_threshold=DUAL_CHUNK_SWAP_DECODE_THRESHOLD,
                 )
-                top_k_indices_skip_li_query = torch.from_numpy(local_topk_indices).to(
+                local_positions, _, _, _ = build_dual_chunk_swap_plan(
+                    query_lens=query_lens_cpu_for_dsa_cp,
+                    group_size=global_tp_size,
+                    rank=tp_rank,
+                    decode_threshold=DUAL_CHUNK_SWAP_DECODE_THRESHOLD,
+                )
+                input_positions, slot_mapping = build_dsa_cp_dual_chunk_swap_inputs(
+                    input_positions=input_positions[:num_actual_tokens],
+                    slot_mapping=slot_mapping[:num_actual_tokens],
+                    query_lens=query_lens_cpu_for_dsa_cp,
+                    padded_lens=padded_query_lens,
+                )
+                local_positions_tensor = torch.from_numpy(local_positions).to(dtype=torch.int64, device=self.device)
+                slot_mapping_cp = torch.index_select(slot_mapping, 0, local_positions_tensor)
+                input_positions_cp = torch.index_select(input_positions, 0, local_positions_tensor)
+                cos, sin = get_cos_and_sin_mla(input_positions_cp, True)
+
+                num_local_query_slots = int(local_positions.shape[0])
+                num_local_query_tokens = int(actual_seq_lengths_query_cpu[-1]) if actual_seq_lengths_query_cpu.size > 0 else 0
+                num_local_indexer_tokens = num_local_query_tokens
+                num_total_seqs = int(actual_seq_lengths_key_cpu.shape[0])
+                num_actual_seqs = num_total_seqs
+                metadata_num_input_tokens = num_local_query_slots
+
+                actual_seq_lengths_query[:num_total_seqs] = torch.from_numpy(actual_seq_lengths_query_cpu).to(
                     dtype=torch.int32,
                     device=self.device,
                 )
+                actual_seq_lengths_key[:num_total_seqs] = torch.from_numpy(actual_seq_lengths_key_cpu).to(
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                actual_seq_lengths_query = actual_seq_lengths_query[:num_total_seqs]
+                actual_seq_lengths_key = actual_seq_lengths_key[:num_total_seqs]
 
-            dsa_cp_context = DSACPContext(
-                num_tokens=num_tokens,
-                num_tokens_pad=num_tokens_pad,
-                local_start=local_start,
-                local_end=local_end,
-                local_end_with_pad=local_end_with_pad,
-                slot_mapping_cp=slot_mapping_cp,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-            )
+                block_table = torch.index_select(
+                    block_table,
+                    0,
+                    torch.from_numpy(segment_req_indices).to(dtype=torch.int64, device=block_table.device),
+                )
+
+                logger.info_once(
+                    "[DSA-CP option2] dual chunk swap metadata path enabled: tp_size=%d "
+                    "sample_query_lens=%s sample_padded_lens=%s",
+                    global_tp_size,
+                    query_lens_cpu_for_dsa_cp[:8].tolist(),
+                    padded_query_lens[:8].tolist(),
+                )
+            else:
+                num_tokens = num_input_tokens
+                num_tokens_pad = _round_up(num_tokens, global_tp_size)
+                num_tokens_per_device = num_tokens_pad // global_tp_size
+                local_start = tp_rank * num_tokens_per_device
+                local_end_with_pad = local_start + num_tokens_per_device
+                local_end = min(local_end_with_pad, num_actual_tokens)
+                num_local_query_slots = num_tokens_per_device
+
+                pad_size = num_tokens_pad - cos.shape[0]
+                assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
+
+                if pad_size > 0:
+                    cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
+                    sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
+
+                pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
+                if pad_size_slot > 0:
+                    slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
+                else:
+                    slot_mapping = slot_mapping[:num_tokens_pad]
+                slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
+
+                cos = cos[local_start:local_end_with_pad]
+                sin = sin[local_start:local_end_with_pad]
+
+                assert cos.shape[0] == num_tokens_per_device, (
+                    f"cos.shape[0] must be equal to num_tokens_per_device, \
+                        got {cos.shape[0]} and {num_tokens_per_device}"
+                )
+                assert slot_mapping_cp.shape[0] == num_tokens_per_device, (
+                    f"slot_mapping_cp.shape[0] must be equal to num_tokens_per_device, \
+                        got {slot_mapping_cp.shape[0]} and {num_tokens_per_device}"
+                )
+                assert slot_mapping.shape[0] == num_tokens_pad, (
+                    f"slot_mapping.shape[0] must be equal to num_tokens_pad, \
+                        got {slot_mapping.shape[0]} and {num_tokens_pad}"
+                )
+
+                num_segs = num_total_seqs
+                actual_seq_lengths_query_cpu = np.zeros(num_segs, dtype=np.int32)
+                actual_seq_lengths_key_cpu = np.zeros(num_segs, dtype=np.int32)
+                prefix_num_segs = min(num_actual_seqs, num_segs)
+                last_token = 0
+                cum = 0
+                num_local_indexer_tokens = 0
+                for i in range(0, num_segs):
+                    global_start = last_token
+                    global_end = int(cum_query_lens_cpu_for_dsa_cp[i])
+                    last_token = global_end
+
+                    req_local_start = max(global_start, local_start)
+                    req_local_end = min(global_end, local_end_with_pad)
+                    num_local_tokens = max(req_local_end - req_local_start, 0)
+
+                    if num_local_tokens > 0:
+                        cum += num_local_tokens
+                        actual_seq_lengths_query[i] = cum
+                        actual_seq_lengths_query_cpu[i] = cum
+
+                        offset = global_end - req_local_end
+                        actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
+                        actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
+                    else:
+                        actual_seq_lengths_query[i] = cum
+                        # Keep the request-level KV length even when this rank has no
+                        # local queries for the segment; skip-topk only looks at the
+                        # query deltas, but SFA still consumes the per-segment KV view.
+                        actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i])
+                        actual_seq_lengths_query_cpu[i] = cum
+                        actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i])
+
+                    if i + 1 == prefix_num_segs:
+                        num_local_indexer_tokens = cum
+
+                actual_seq_lengths_query = actual_seq_lengths_query[:num_segs]
+                actual_seq_lengths_key = actual_seq_lengths_key[:num_segs]
+                num_local_query_tokens = cum
+                if self.enable_lightning_indexer_skip and top_k_indices_skip_li_query is not None:
+                    # Option2 skip suffix still follows DSA-CP local token partitioning,
+                    # so regenerate sparse indices from local query/key lengths instead of
+                    # reusing the global-request layout prepared in model_runner.
+                    local_topk_indices = get_index_of_skipped_queries_numpy(
+                        actual_seq_lengths_query_cpu,
+                        actual_seq_lengths_key_cpu,
+                        num_actual_seqs,
+                        2048,
+                    )
+                    top_k_indices_skip_li_query = torch.from_numpy(local_topk_indices).to(
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+
+                dsa_cp_context = DSACPContext(
+                    num_tokens=num_tokens,
+                    num_tokens_pad=num_tokens_pad,
+                    local_start=local_start,
+                    local_end=local_end,
+                    local_end_with_pad=local_end_with_pad,
+                    slot_mapping_cp=slot_mapping_cp,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                )
+
+            if use_dual_chunk_swap:
+                dsa_cp_context = DSACPContext(
+                    num_tokens=num_actual_tokens,
+                    num_tokens_pad=int(np.sum(padded_query_lens)),
+                    local_start=0,
+                    local_end=num_local_query_tokens,
+                    local_end_with_pad=num_local_query_slots,
+                    slot_mapping_cp=slot_mapping_cp,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                )
         return self.metadata_cls(  # type: ignore
-            num_input_tokens=common_attn_metadata.num_input_tokens,
+            num_input_tokens=metadata_num_input_tokens,
             num_actual_tokens=num_actual_tokens,
             cum_query_lens=cum_query_lens,
             seq_lens=seq_lens,
@@ -420,8 +616,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             attn_mask=self.attn_mask_builder.get_attention_mask(self.model_config),
             attn_state=common_attn_metadata.attn_state,
             block_table=block_table,
-            sin=sin[:num_input_tokens],
-            cos=cos[:num_input_tokens],
+            sin=sin[:metadata_num_input_tokens],
+            cos=cos[:metadata_num_input_tokens],
             dsa_cp_context=dsa_cp_context,
             num_actual_seqs=num_actual_seqs,
             num_local_query_tokens=num_local_query_tokens,

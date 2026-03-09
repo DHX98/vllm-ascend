@@ -21,11 +21,17 @@ def test_sfa_skip_topk_alignment_uses_local_query_slots_without_device_sync():
     source = Path("vllm_ascend/attention/sfa_v1.py").read_text()
 
     assert "max_num_option2_reqs = max_num_reqs * 2" in source
+    assert "DUAL_CHUNK_SWAP_DECODE_THRESHOLD = 1" in source
+    assert "def build_dsa_cp_dual_chunk_swap_segments(" in source
+    assert "def build_dsa_cp_dual_chunk_swap_inputs(" in source
+    assert "build_dual_chunk_swap_plan(" in source
+    assert "segment_req_indices" in source
+    assert "metadata_num_input_tokens = num_local_query_slots" in source
     assert "num_tokens = attn_metadata.num_local_indexer_tokens" in source
     assert "num_local_indexer_tokens=num_local_indexer_tokens" in source
     assert "num_local_query_slots=num_local_query_slots" in source
     assert "num_local_query_slots = num_input_tokens" in source
-    assert "num_local_query_slots = num_tokens_per_device" in source
+    assert "num_local_query_slots = int(local_positions.shape[0])" in source
     assert "align_topk_indices_to_query_slots(topk_indices, attn_metadata.num_local_query_slots)" in source
     assert "local_topk_indices = get_index_of_skipped_queries_numpy(" in source
     assert "actual_seq_lengths_query_cpu = np.zeros(num_segs, dtype=np.int32)" in source
@@ -44,6 +50,7 @@ def test_sfa_skip_topk_alignment_uses_local_query_slots_without_device_sync():
     assert "actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i])" in source
     assert "actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i])" in source
     assert source.index("input_positions = input_positions_pad") < source.index("cos, sin = get_cos_and_sin_mla(input_positions, True)")
+    assert "slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]" in source
 
 
 def test_model_runner_tracks_actual_request_count_separately_from_padding():
