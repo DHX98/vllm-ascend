@@ -372,9 +372,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i]) - offset
                 else:
                     actual_seq_lengths_query[i] = cum
-                    actual_seq_lengths_key[i] = 0
+                    # Keep the request-level KV length even when this rank has no
+                    # local queries for the segment; skip-topk only looks at the
+                    # query deltas, but SFA still consumes the per-segment KV view.
+                    actual_seq_lengths_key[i] = int(seq_lens_cpu_for_dsa_cp[i])
                     actual_seq_lengths_query_cpu[i] = cum
-                    actual_seq_lengths_key_cpu[i] = 0
+                    actual_seq_lengths_key_cpu[i] = int(seq_lens_cpu_for_dsa_cp[i])
 
                 if i + 1 == prefix_num_segs:
                     num_local_indexer_tokens = cum
@@ -993,6 +996,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if (
             self.enable_lightning_indexer_skip
             and not forward_context.in_profile_run
+            and attn_metadata.num_actual_tokens > 1
             and layer_name.endswith("layers.0.self_attn")
             and AscendSFAImpl._logged_option2_attention_debug < 2
         ):
@@ -1003,7 +1007,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "[DSA-CP option2][attn-debug][pre-sfa] layer=%s state=%s "
                 "num_input_tokens=%d num_actual_tokens=%d num_actual_seqs=%d "
                 "local_indexer_tokens=%d local_query_tokens=%d local_query_slots=%d "
-                "ql_nope=%s q_pe=%s topk_shape=%s topk_row0=%s "
+                "ql_nope=%s q_pe=%s topk_shape=%s topk_row0=%s topk_row_last=%s "
                 "cum_query_lens=%s seq_lens=%s actual_seq_q=%s actual_seq_k=%s slot_mapping=%s",
                 layer_name,
                 attn_metadata.attn_state.name,
@@ -1017,6 +1021,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _tensor_stats(q_pe),
                 tuple(topk_indices.shape),
                 _preview_tensor(topk_indices[0, 0] if topk_indices.numel() > 0 else None),
+                _preview_tensor(topk_indices[-1, 0] if topk_indices.numel() > 0 else None),
                 _preview_tensor(attn_metadata.cum_query_lens),
                 _preview_tensor(attn_metadata.seq_lens),
                 _preview_tensor(actual_seq_lengths_query),
@@ -1031,6 +1036,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if (
             self.enable_lightning_indexer_skip
             and not forward_context.in_profile_run
+            and attn_metadata.num_actual_tokens > 1
             and layer_name.endswith("layers.0.self_attn")
             and AscendSFAImpl._logged_option2_attention_debug < 2
         ):

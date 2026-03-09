@@ -422,6 +422,7 @@ class NPUModelRunner(GPUModelRunner):
         self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
         self.lightning_indexer_skip_threshold = get_lightning_indexer_skip_threshold()
         self.lightning_indexer_metadata: AscendLightningIndexerMetadata | None = None
+        self._logged_option2_capture_debug = False
         self._logged_option2_batch_debug = False
         self._logged_option2_logits_debug = False
 
@@ -434,6 +435,69 @@ class NPUModelRunner(GPUModelRunner):
 
     def _sync_device(self) -> None:
         torch.npu.synchronize()
+
+    def _build_lightning_indexer_metadata(
+        self,
+        num_scheduled_tokens_np: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray | torch.Tensor | None = None,
+    ) -> AscendLightningIndexerMetadata | None:
+        if not self.enable_lightning_indexer_skip:
+            return None
+
+        num_actual_reqs = int(np.count_nonzero(num_scheduled_tokens_np))
+        actual_num_scheduled_tokens_np = num_scheduled_tokens_np[:num_actual_reqs]
+        if num_actual_reqs == 0:
+            return None
+
+        if num_computed_tokens_cpu is None:
+            actual_num_computed_tokens_np = np.zeros(num_actual_reqs, dtype=np.int32)
+        elif torch.is_tensor(num_computed_tokens_cpu):
+            actual_num_computed_tokens_np = (
+                num_computed_tokens_cpu[:num_actual_reqs].detach().cpu().numpy().astype(np.int32, copy=False)
+            )
+        else:
+            actual_num_computed_tokens_np = np.asarray(num_computed_tokens_cpu[:num_actual_reqs], dtype=np.int32)
+
+        li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skipped_query_mask = get_sfa_skip_indices(
+            actual_num_computed_tokens_np,
+            actual_num_scheduled_tokens_np,
+            skip_threshold=self.lightning_indexer_skip_threshold,
+        )
+
+        if li_reorder_indices is None:
+            return None
+
+        li_restore_indices = np.argsort(li_reorder_indices, kind="stable").astype(np.int32)
+        li_cum_query_lens_cpu = torch.from_numpy(li_cum_query_lens)
+        li_seq_lens_cpu = torch.from_numpy(li_seq_lens)
+        top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
+            li_cum_query_lens,
+            li_seq_lens,
+            num_actual_reqs,
+            2048,
+        )
+        return AscendLightningIndexerMetadata(
+            li_reorder_indices=torch.from_numpy(li_reorder_indices)
+            .pin_memory()
+            .to(dtype=torch.int32, device=self.device, non_blocking=True),
+            li_restore_indices=torch.from_numpy(li_restore_indices)
+            .pin_memory()
+            .to(dtype=torch.int32, device=self.device, non_blocking=True),
+            li_cum_query_lens=li_cum_query_lens_cpu.pin_memory().to(
+                dtype=torch.int32, device=self.device, non_blocking=True
+            ),
+            li_cum_query_lens_cpu=li_cum_query_lens_cpu,
+            li_seq_lens=li_seq_lens_cpu.pin_memory().to(dtype=torch.int32, device=self.device, non_blocking=True),
+            li_seq_lens_cpu=li_seq_lens_cpu,
+            li_skip_request_mask=torch.from_numpy(li_skipped_query_mask)
+            .pin_memory()
+            .to(dtype=torch.bool, device=self.device, non_blocking=True),
+            top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
+            .pin_memory()
+            .to(dtype=torch.int32, device=self.device, non_blocking=True),
+            num_actual_reqs=num_actual_reqs,
+            skip_threshold=self.lightning_indexer_skip_threshold,
+        )
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -1262,53 +1326,10 @@ class NPUModelRunner(GPUModelRunner):
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            if self.enable_lightning_indexer_skip:
-                num_actual_reqs = int(np.count_nonzero(num_scheduled_tokens_np))
-                actual_num_scheduled_tokens_np = num_scheduled_tokens_np[:num_actual_reqs]
-                li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skipped_query_mask = get_sfa_skip_indices(
-                    self.input_batch.num_computed_tokens_cpu,
-                    actual_num_scheduled_tokens_np,
-                    skip_threshold=self.lightning_indexer_skip_threshold,
-                )
-
-                if li_reorder_indices is not None:
-                    li_restore_indices = np.argsort(li_reorder_indices, kind="stable").astype(np.int32)
-                    li_cum_query_lens_cpu = torch.from_numpy(li_cum_query_lens)
-                    li_seq_lens_cpu = torch.from_numpy(li_seq_lens)
-                    top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
-                        li_cum_query_lens,
-                        li_seq_lens,
-                        num_actual_reqs,
-                        2048,
-                    )
-                    self.lightning_indexer_metadata = AscendLightningIndexerMetadata(
-                        li_reorder_indices=torch.from_numpy(li_reorder_indices)
-                        .pin_memory()
-                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        li_restore_indices=torch.from_numpy(li_restore_indices)
-                        .pin_memory()
-                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        li_cum_query_lens=li_cum_query_lens_cpu
-                        .pin_memory()
-                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        li_cum_query_lens_cpu=li_cum_query_lens_cpu,
-                        li_seq_lens=li_seq_lens_cpu
-                        .pin_memory()
-                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        li_seq_lens_cpu=li_seq_lens_cpu,
-                        li_skip_request_mask=torch.from_numpy(li_skipped_query_mask)
-                        .pin_memory()
-                        .to(dtype=torch.bool, device=self.device, non_blocking=True),
-                        top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
-                        .pin_memory()
-                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                        num_actual_reqs=num_actual_reqs,
-                        skip_threshold=self.lightning_indexer_skip_threshold,
-                    )
-                else:
-                    self.lightning_indexer_metadata = None
-            else:
-                self.lightning_indexer_metadata = None
+            self.lightning_indexer_metadata = self._build_lightning_indexer_metadata(
+                num_scheduled_tokens_np,
+                self.input_batch.num_computed_tokens_cpu,
+            )
 
             if (
                 cudagraph_mode == CUDAGraphMode.FULL
@@ -2406,17 +2427,41 @@ class NPUModelRunner(GPUModelRunner):
 
             num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
 
-            pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-            attn_metadata, _ = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                max_query_len=max_query_len,
-                ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
-                for_cudagraph_capture=is_graph_capturing,
-                num_scheduled_tokens_np=actual_num_scheduled_tokens,
+            prev_lightning_indexer_metadata = self.lightning_indexer_metadata
+            self.lightning_indexer_metadata = self._build_lightning_indexer_metadata(
+                actual_num_scheduled_tokens,
             )
+            if (
+                self.enable_lightning_indexer_skip
+                and self.lightning_indexer_metadata is not None
+                and not self._logged_option2_capture_debug
+            ):
+                logger.info(
+                    "[DSA-CP option2][capture-debug] num_reqs=%d num_reqs_padded=%d "
+                    "num_tokens=%d num_tokens_padded=%d li_cum_query_lens=%s li_seq_lens=%s li_skip_mask=%s",
+                    num_reqs,
+                    num_reqs_padded,
+                    num_tokens_unpadded,
+                    num_tokens_padded,
+                    _preview_values(self.lightning_indexer_metadata.li_cum_query_lens_cpu),
+                    _preview_values(self.lightning_indexer_metadata.li_seq_lens_cpu),
+                    _preview_values(self.lightning_indexer_metadata.li_skip_request_mask),
+                )
+                self._logged_option2_capture_debug = True
+            pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+            try:
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                    for_cudagraph_capture=is_graph_capturing,
+                    num_scheduled_tokens_np=actual_num_scheduled_tokens,
+                )
+            finally:
+                self.lightning_indexer_metadata = prev_lightning_indexer_metadata
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
