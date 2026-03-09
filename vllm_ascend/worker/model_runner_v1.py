@@ -121,6 +121,7 @@ from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.utils import (
     check_gdn_layer,
+    enable_dsa_cp,
     enable_lightning_indexer_skip,
     enable_sp,
     enable_sp_by_pass,
@@ -465,6 +466,14 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         if li_reorder_indices is None:
+            return None
+
+        prefix_num_tokens = int(li_cum_query_lens[num_actual_reqs - 1]) if num_actual_reqs > 0 else 0
+        if enable_dsa_cp() and prefix_num_tokens == 0:
+            logger.info_once(
+                "[DSA-CP option2] all requests are fully skipped by lightning_indexer_skip; "
+                "falling back to the real lightning indexer path for correctness."
+            )
             return None
 
         li_restore_indices = np.argsort(li_reorder_indices, kind="stable").astype(np.int32)
