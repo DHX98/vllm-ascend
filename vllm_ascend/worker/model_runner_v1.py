@@ -1247,6 +1247,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 if li_reorder_indices is not None:
+                    li_restore_indices = np.argsort(li_reorder_indices, kind="stable").astype(np.int32)
                     li_cum_query_lens_cpu = torch.from_numpy(li_cum_query_lens)
                     li_seq_lens_cpu = torch.from_numpy(li_seq_lens)
                     top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
@@ -1257,6 +1258,9 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     self.lightning_indexer_metadata = AscendLightningIndexerMetadata(
                         li_reorder_indices=torch.from_numpy(li_reorder_indices)
+                        .pin_memory()
+                        .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                        li_restore_indices=torch.from_numpy(li_restore_indices)
                         .pin_memory()
                         .to(dtype=torch.int32, device=self.device, non_blocking=True),
                         li_cum_query_lens=li_cum_query_lens_cpu
@@ -1382,7 +1386,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             if self.enable_lightning_indexer_skip and self.lightning_indexer_metadata is not None:
-                hidden_states = hidden_states_reorder(hidden_states, self.lightning_indexer_metadata.li_reorder_indices)
+                hidden_states = hidden_states_reorder(hidden_states, self.lightning_indexer_metadata.li_restore_indices)
 
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2287,6 +2291,7 @@ class NPUModelRunner(GPUModelRunner):
             )
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        actual_num_scheduled_tokens = num_scheduled_tokens.copy()
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
@@ -2332,11 +2337,12 @@ class NPUModelRunner(GPUModelRunner):
             attn_metadata, _ = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
-                num_reqs=num_reqs_padded,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
                 max_query_len=max_query_len,
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
-                num_scheduled_tokens_np=num_scheduled_tokens,
+                num_scheduled_tokens_np=actual_num_scheduled_tokens,
             )
 
         with self.maybe_dummy_run_with_lora(

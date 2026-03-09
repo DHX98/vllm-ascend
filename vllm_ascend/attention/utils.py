@@ -121,6 +121,7 @@ class AscendPrefillContextParallelMetadata:
 @dataclass
 class AscendLightningIndexerMetadata:
     li_reorder_indices: torch.Tensor = None
+    li_restore_indices: torch.Tensor = None
     li_cum_query_lens: torch.Tensor = None
     li_cum_query_lens_cpu: torch.Tensor = None
     li_seq_lens: torch.Tensor = None
@@ -480,6 +481,6 @@ def maybe_pad_and_reorder_inputs(input_ids, positions, reorder_indices):
     return input_ids_reorder_pad, positions_reorder_pad
 
 
-def hidden_states_reorder(hidden_states, reorder_indices):
-    restore_indices = torch.argsort(reorder_indices.to(dtype=torch.int64))
+def hidden_states_reorder(hidden_states, restore_indices):
+    restore_indices = restore_indices.to(dtype=torch.int64)
     return torch.index_select(hidden_states, 0, restore_indices)

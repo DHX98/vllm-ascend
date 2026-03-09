@@ -43,4 +43,9 @@ def test_model_runner_tracks_actual_request_count_separately_from_padding():
 
     assert "num_actual_reqs = int(np.count_nonzero(num_scheduled_tokens_np))" in source
     assert "actual_num_scheduled_tokens_np = num_scheduled_tokens_np[:num_actual_reqs]" in source
+    assert "li_restore_indices = np.argsort(li_reorder_indices, kind=\"stable\").astype(np.int32)" in source
+    assert "li_restore_indices=torch.from_numpy(li_restore_indices)" in source
+    assert "hidden_states_reorder(hidden_states, self.lightning_indexer_metadata.li_restore_indices)" in source
+    assert "actual_num_scheduled_tokens = num_scheduled_tokens.copy()" in source
+    assert "num_reqs_padded=num_reqs_padded" in source
     assert "num_actual_reqs=num_actual_reqs" in source
