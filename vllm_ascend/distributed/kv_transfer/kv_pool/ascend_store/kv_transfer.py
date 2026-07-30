@@ -497,21 +497,39 @@ class KVTransferThread(threading.Thread):
                     continue
                 self._handle_request(request_data)
             except Exception as e:
+                import traceback
+
                 if request_data is not None:
                     self._handle_request_exception(request_data)
+                else:
+                    # get() succeeded path always has request_data; keep join() safe
+                    # if a future change leaves it unset after dequeue.
+                    try:
+                        self.request_queue.task_done()
+                    except Exception:
+                        pass
                 logger.error(
-                    "Error in KVCacheTransferThread(%s). type=%s, error=%s. Check thread state and request processing.",
+                    "Error in KVCacheTransferThread(%s). type=%s, error=%s. "
+                    "Check thread state and request processing.\n%s",
                     self.name,
                     type(e).__name__,
                     e,
+                    traceback.format_exc(),
                 )
 
     def _handle_request(self, req_meta: Any):
         pass
 
     def _handle_request_exception(self, request_data: Any):
-        """Allow subclasses to complete queue/request bookkeeping on errors."""
-        pass
+        """Complete queue bookkeeping on errors so wait_for_save()/join() cannot hang.
+
+        Subclasses may override to also clear per-request store tracking, but must
+        still call task_done() (or invoke super).
+        """
+        try:
+            self.request_queue.task_done()
+        except Exception:
+            pass
 
     def lookup(
         self,
@@ -818,9 +836,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             stored_events: list[BlockStored] = []
             all_hashes = []
             if self.enable_kv_event:
+                # Match process_tokens / put key build: remap with cache_family_ratio.
+                remap_bs = group_block_size * infer_cache_family_ratio(cache_family)
                 group_block_hashes = get_block_hashes(
                     req_meta.block_hashes,
-                    group_block_size,
+                    remap_bs,
                     getattr(self.token_database, "hash_block_size", group_block_size),
                 )
                 all_hashes = [maybe_convert_block_hash(bh) for bh in group_block_hashes]
