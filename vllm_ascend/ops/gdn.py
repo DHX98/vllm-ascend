@@ -36,7 +36,6 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
-from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
@@ -699,23 +698,37 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
+            # The ACLNN op consumes the native Mamba state layout
+            # (B, Nv, Dv, Dk); unlike the old Triton path, do not transpose it.
+            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             clear_ssm_states(initial_state, has_initial_state)
-            (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                prebuilt_meta=get_non_spec_chunked_prefill_meta(attn_metadata),
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
+
+            # The concatenated prefill batch is [1, T, ...]. The ACLNN custom
+            # op uses TND inputs and does not perform q/k L2 normalization.
+            q_tnd = l2norm_fwd(query_non_spec.squeeze(0))
+            k_tnd = l2norm_fwd(key_non_spec.squeeze(0))
+            v_tnd = value_non_spec.squeeze(0)
+            beta_tnd = beta_non_spec.squeeze(0)
+            g_tnd = g_non_spec.squeeze(0)
+            actual_seq_lengths = (
+                non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]
+            ).to(torch.int32).contiguous()
+
+            core_attn_out_non_spec, last_recurrent_state = (
+                torch.ops._C_ascend.npu_chunk_gated_delta_rule(
+                    q_tnd,
+                    k_tnd,
+                    v_tnd,
+                    beta_tnd,
+                    initial_state,
+                    actual_seq_lengths,
+                    g_tnd,
+                    q_tnd.shape[-1] ** -0.5,
+                )
             )
+            core_attn_out_non_spec = core_attn_out_non_spec.unsqueeze(0)
             ssm_state[non_spec_state_indices_tensor] = (
-                last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+                last_recurrent_state.contiguous().to(ssm_state.dtype)
             )
         elif attn_metadata.num_decodes > 0:
             cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
