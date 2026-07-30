@@ -700,6 +700,23 @@ at::Tensor npu_recurrent_gated_delta_rule_meta(
     return output;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_chunk_gated_delta_rule_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
+    const at::Tensor& actual_seq_lengths,
+    const c10::optional<at::Tensor>& g,
+    double scale_value)
+{
+    auto out_options = value.options().dtype(at::ScalarType::BFloat16);
+    at::Tensor out = at::empty_symint(value.sym_sizes(), out_options);
+    at::Tensor final_state =
+        at::empty_symint(initial_state.sym_sizes(), initial_state.options());
+    return std::make_tuple(out, final_state);
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating_meta(
     const at::Tensor& A_log,
     const at::Tensor& a,
@@ -1699,6 +1716,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // recurrent_gated_delta_rule meta implementation
     ops.impl("npu_recurrent_gated_delta_rule", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_meta);
+    ops.impl("npu_chunk_gated_delta_rule", &vllm_ascend::meta::npu_chunk_gated_delta_rule_meta);
     // Launch host print from device
     ops.impl("device_print", &vllm_ascend::meta::device_print_meta);
     // launch host print from device for tensors
