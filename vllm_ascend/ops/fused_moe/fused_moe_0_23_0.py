@@ -343,17 +343,23 @@ class AscendFusedMoE(FusedMoE):
         )
 
     def _shared_experts_part1(self, hidden_states: torch.Tensor):
-        shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
-        return shared_gate_up
-
-    def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
-        shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
-        shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
-
-        # Qwen3-Next specific gating mechanism
+        # gate_up + act (+ optional expert_gate) can overlap dispatch/GMM.
+        # Only down_proj must wait on before_combine.
         assert self._shared_experts is not None
+        shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
+        shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
+        gate_out = None
         if hasattr(self._shared_experts, "expert_gate") and self._shared_experts.expert_gate is not None:
             gate_out, _ = self._shared_experts.expert_gate(hidden_states)  # type: ignore
+        return shared_act, gate_out
+
+    def _shared_experts_part2(
+        self, hidden_states: torch.Tensor, part1_out: tuple[torch.Tensor, torch.Tensor | None]
+    ):
+        assert self._shared_experts is not None
+        shared_act, gate_out = part1_out
+        shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
+        if gate_out is not None:
             shared_out = F.sigmoid(gate_out) * shared_out
         return shared_out
 
@@ -643,14 +649,17 @@ class AscendFusedMoE(FusedMoE):
                 maybe_wait_event(fused_moe_evts.before_combine)
                 shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
             else:
-                # Ensure the shared experts wait for hidden_states to be ready.
-                torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
-                # Execute the gate projection and activation concurrently with the
-                # dispatch communication.
-                maybe_wait_event(fused_moe_evts.before_dispatch)
+                # Prefer after_routed_experts (gate done) so part1 can overlap
+                # topk + dispatch + gmm; fall back to before_dispatch / before_routed.
+                start_evt = (
+                    fused_moe_evts.after_routed_experts
+                    or fused_moe_evts.before_dispatch
+                    or fused_moe_evts.before_routed_experts
+                )
+                torch.npu.current_stream().wait_event(start_evt)
+                # gate_up + act (+ optional expert_gate) with dispatch/gmm.
                 part1_out = self._shared_experts_part1(hidden_states)
-                # Execute the down projection concurrently with the combine
-                # communication.
+                # down_proj with combine communication.
                 maybe_wait_event(fused_moe_evts.before_combine)
                 shared_out = self._shared_experts_part2(hidden_states, part1_out)
 

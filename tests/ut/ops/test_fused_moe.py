@@ -911,10 +911,11 @@ class TestAscendFusedMoESharedExperts:
         shared_experts.expert_gate.return_value = (gate_out, None)
         layer._shared_experts = shared_experts
 
-        part1_out = layer._shared_experts_part1(hidden_states)
-        part2_out = layer._shared_experts_part2(hidden_states, part1_out)
+        shared_act, part1_gate_out = layer._shared_experts_part1(hidden_states)
+        part2_out = layer._shared_experts_part2(hidden_states, (shared_act, part1_gate_out))
 
-        torch.testing.assert_close(part1_out, gate_up)
+        torch.testing.assert_close(shared_act, gate_up + 1)
+        torch.testing.assert_close(part1_gate_out, gate_out)
         torch.testing.assert_close(part2_out, F.sigmoid(gate_out) * down_out)
 
     @pytest.mark.parametrize("has_shared_experts", [False, True])
