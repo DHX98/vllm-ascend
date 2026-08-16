@@ -16,15 +16,18 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCudaGraphManager
@@ -37,6 +40,31 @@ from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_grap
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
+def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
+    """Collect the actual per-graph token counts that will be captured.
+
+    With speculative decoding under FULL_DECODE_ONLY, each raw
+    ``cudagraph_capture_size`` is rounded up to a multiple of
+    ``decode_query_len`` (see ``CudaGraphManager._init_candidates``), so the
+    real graph sizes differ from ``compilation_config.cudagraph_capture_sizes``.
+    The attention backend keys its per-size graph params (events/handles/...)
+    by these rounded token counts, so they must be derived from the actual
+    capture descriptors, not the raw config sizes.
+    """
+    return sorted({desc.num_tokens for descs in capture_descs.values() for desc in descs})
+
+
+def _get_graph_update_backend(
+    attn_groups: list[list[AttentionGroup]],
+) -> type[AttentionBackend]:
+    for groups in attn_groups:
+        for group in groups:
+            backend = group.backend
+            if backend.get_impl_cls() is not None:
+                return backend
+    raise RuntimeError("No executable attention backend is available for full-graph parameter updates.")
+
+
 class ModelAclGraphManager(ModelCudaGraphManager):
     """ACL Model Cuda Graph Manager for Ascend NPUs."""
 
@@ -47,19 +75,26 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
         model_runner: Any,
+        lora_capture_cases: list[int] | None = None,
     ):
         super().__init__(
             vllm_config,
             device,
             cudagraph_mode,
             decode_query_len,
+            lora_capture_cases=lora_capture_cases,
         )
         # set model runner attribute, so we can access attributes model runner
         # when call `run_fullgraph` method in CudaGraphManager,
         # then we don't need to # copy `execute_model` method in `NPUModelRunner` class.
         self.model_runner = model_runner
-        # capture_sizes sorts in ascending order.
-        self.capture_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
+        # Reuse the public update_stream from model_runner (shared with draft).
+        self.update_stream = self.model_runner.update_stream
+        # The attention backend keys its per-size graph params by the actual
+        # captured token counts (rounded up to decode_query_len when using
+        # speculative decoding), so derive them from the capture descriptors
+        # instead of the raw config sizes.
+        self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         # vllm-ascend need to update graph params of attention backend.
         # so we need to set graph params before capture full graph.
         if super().needs_capture():
@@ -69,31 +104,35 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
+        assert self.update_stream is not None
+        self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
 
-        positions = self.model_runner.input_buffers.positions[:num_tokens]
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
-        num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens, device=self.device)
-        with set_forward_context(
-            self.model_runner.model_state.attn_metadata,
-            self.vllm_config,
-            num_tokens=num_tokens,
-            cudagraph_runtime_mode=desc.cg_mode,
-            num_tokens_across_dp=num_tokens_across_dp,
-            batch_descriptor=None,  # Full graph model don't need batch_descriptor
-            slot_mapping=None,
+        num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens)
+        with (
+            set_current_vllm_config(self.vllm_config),
+            set_forward_context(
+                self.model_runner.model_state.attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                cudagraph_runtime_mode=desc.cg_mode,
+                num_tokens_across_dp=num_tokens_across_dp,
+                batch_descriptor=None,  # Full graph model don't need batch_descriptor
+                slot_mapping=None,
+            ),
         ):
             forward_context = get_forward_context()
+            attn_backend = _get_graph_update_backend(self.model_runner.attn_groups)
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
-                self.model_runner.attn_groups[0][0].backend,
-                self.model_runner.update_stream,
+                attn_backend,
+                self.update_stream,
                 forward_context,
                 num_tokens,
                 self.vllm_config,
                 self.model_runner.speculative_config,
-                positions.shape[0],
             )
         return ret
 
@@ -108,6 +147,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         kv_cache_config: KVCacheConfig,
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
+        lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
@@ -121,9 +161,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 block_tables,
                 attn_groups,
                 kv_cache_config,
-                has_lora,
-                use_aux_hidden_state_outputs,
-                progress_bar_desc,
+                has_lora=has_lora,
+                use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
+                lora_capture_hook=lora_capture_hook,
+                progress_bar_desc=progress_bar_desc,
             )
 
 
@@ -156,3 +197,25 @@ class ModelWithContext(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor):
         # draft model has `compute_logits`, which is not in ModelWithContext
         return self.original_model.compute_logits(hidden_states)
+
+    def compute_draft_logits(self, hidden_states: torch.Tensor):
+        return self.original_model.compute_draft_logits(hidden_states)
+
+    def markov_embed(self, token_ids: torch.Tensor):
+        return self.original_model.markov_embed(token_ids)
+
+    def markov_bias(self, markov_embed: torch.Tensor):
+        return self.original_model.markov_bias(markov_embed)
+
+    def map_draft_to_target(self, draft_ids: torch.Tensor):
+        return self.original_model.map_draft_to_target(draft_ids)
+
+
+@contextmanager
+def model_capture_wrapper(speculator, is_draft_model_prefill):
+    """Context manager to override speculator's model for speculator capturing."""
+    try:
+        speculator.model = ModelWithContext(speculator.model, True, is_draft_model_prefill)
+        yield
+    finally:
+        speculator.model = speculator.model.get_original_model()
