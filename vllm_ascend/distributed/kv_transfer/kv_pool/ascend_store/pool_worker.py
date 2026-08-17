@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import importlib
 import math
 import threading
@@ -203,6 +205,9 @@ class KVPoolWorker:
         else:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
+        if os.getenv("S6C_LOCAL_PUT", "0") == "1":
+            self.put_step = 1
+            self.head_or_tp_rank = self.tp_rank
         self.my_key_index = (
             self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step)
             + self.dcp_rank * (self.tp_size // self.put_step)

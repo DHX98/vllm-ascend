@@ -1,4 +1,5 @@
 import importlib
+import os
 import math
 from typing import Any, cast
 
@@ -193,6 +194,8 @@ class KVPoolScheduler:
         if self.num_kv_head < self.tp_size:
             self.put_step = self.tp_size // self.num_kv_head
         else:
+            self.put_step = 1
+        if os.getenv("S6C_LOCAL_PUT", "0") == "1":
             self.put_step = 1
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.layerwise_offload = False
