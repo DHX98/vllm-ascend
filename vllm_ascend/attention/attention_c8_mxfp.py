@@ -876,16 +876,15 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             return output.fill_(0)
         if getattr(self, "enable_hamming_sparse", False):
             raise NotImplementedError("C8_MXFP attention does not support hamming sparse KV compression yet.")
-        if self.vllm_config.kv_transfer_config is not None and not uses_mooncake_connector(
-            self.vllm_config.kv_transfer_config
-        ):
-            # Other connectors move only the K/V pair and would silently drop
-            # the scale caches.
+        transfer_config = self.vllm_config.kv_transfer_config
+        is_ascend_store = getattr(transfer_config, "kv_connector", None) == "AscendStoreConnector"
+        if transfer_config is not None and not (uses_mooncake_connector(transfer_config) or is_ascend_store):
+            # Both supported connector families move all four cache tensors;
+            # other connectors may move only K/V and silently drop the scales.
             raise NotImplementedError(
-                "C8_MXFP v1 PD disaggregation (kv_transfer) is only supported with "
-                "MooncakeConnectorV1, whose block-level transfer registers and moves "
-                "every per-layer cache tensor (FP8 K/V plus both E8M0 scale caches) "
-                "as raw blocks."
+                "C8_MXFP v1 KV transfer requires MooncakeConnectorV1 or "
+                "AscendStoreConnector; both register and move every per-layer "
+                "cache tensor (FP8 K/V plus both E8M0 scale caches) as raw blocks."
             )
         if kv_cache is None or len(kv_cache) < 4:
             raise RuntimeError(
